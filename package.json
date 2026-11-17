@@ -1,0 +1,53 @@
+{
+  "name": "buildnex-kadai-api",
+  "version": "1.0.0",
+  "description": "BuildNex ShopOS e-commerce REST API (Node.js, Express, MySQL, TypeScript)",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx watch server.ts",
+    "db:setup": "tsx database/setup.ts",
+    "db:migrate-staff": "tsx database/migrate_staff.ts",
+    "db:migrate-stock": "tsx database/migrate_stock_inventory.ts",
+    "db:migrate-catalog": "tsx database/migrate_product_catalog.ts",
+    "db:migrate-inventory": "tsx database/migrate_inventory.ts",
+    "db:migrate-branches": "tsx database/migrate_branches_warehouses.ts",
+    "db:migrate-support": "tsx database/migrate_support.ts",
+    "db:migrate-pos": "tsx database/migrate_pos_billing.ts",
+    "db:migrate-tbl-prefix": "tsx database/migrate_tbl_prefix.ts",
+    "db:migrate-company": "tsx database/migrate_company.ts",
+    "db:migrate-company-admin": "tsx database/migrate_company_admin.ts",
+    "db:migrate-drop-user-role-cols": "tsx database/migrate_drop_user_role_cols.ts",
+    "db:migrate-company-scope": "tsx database/migrate_company_scope.ts",
+    "db:migrate-user-admin-flags": "tsx database/migrate_user_admin_flags.ts",
+    "db:migrate-company-bank-docs": "tsx database/migrate_company_bank_docs.ts",
+    "db:migrate-payment-history": "tsx database/migrate_payment_history.ts",
+    "db:migrate-invoice-agreement": "tsx database/migrate_invoice_agreement.ts",
+    "db:migrate-role-company": "tsx database/migrate_role_company.ts",
+    "db:migrate-auth-session": "tsx database/migrate_auth_session.ts",
+    "db:migrate-auth-otp": "tsx database/migrate_auth_otp.ts"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.5.0",
+    "mysql2": "^3.11.3",
+    "nodemailer": "^10.5.0"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.10.1",
+    "@types/nodemailer": "^8.0.2",
+    "nodemon": "^3.1.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
