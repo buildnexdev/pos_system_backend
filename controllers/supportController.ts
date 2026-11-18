@@ -9,8 +9,8 @@ import path from 'path';
 import fs from 'fs';
 import db from '../config/db';
 import { ok, fail, slugify  } from '../utils/helpers';
-import { supportUploadDir  } from '../middleware/supportUpload';
 import { getCompanyId } from '../utils/companyScope';
+import { storeUpload, makeFilename } from '../utils/s3Storage';
 
 const DEFAULT_TENANT_ID = Number(process.env.SUPPORT_TENANT_ID || 1);
 const STATUSES = ['open', 'in_progress', 'waiting_customer', 'resolved', 'closed'];
@@ -97,10 +97,20 @@ function canManageAll(user) {
   return isSuperAdmin(user);
 }
 
+function attachmentUrl(storedName: string) {
+  if (!storedName) return '';
+  if (/^https?:\/\//i.test(storedName)) return storedName;
+  return `/api/uploads/support/${storedName}`;
+}
+
 async function saveAttachments(files, ticketId, messageId, tenant, userId) {
   if (!files || !files.length) return [];
   const saved = [];
   for (const file of files) {
+    const filename = makeFilename('support', file.originalname);
+    const stored = await storeUpload(file, 'support', filename);
+    // Persist absolute S3 URL when used so downloads/previews work without local disk
+    const storedName = stored.storage === 's3' ? stored.url : stored.filename;
     const [result] = await db.query(
       `INSERT INTO support_ticket_attachments
         (ticket_id, message_id, tenant_id, original_name, stored_name, mime_type, file_size, uploaded_by)
@@ -109,8 +119,8 @@ async function saveAttachments(files, ticketId, messageId, tenant, userId) {
         ticketId,
         messageId: messageId || null,
         tenant,
-        originalName: file.originalname || file.filename,
-        storedName: file.filename,
+        originalName: file.originalname || stored.filename,
+        storedName,
         mimeType: file.mimetype,
         fileSize: file.size || 0,
         uploadedBy: userId,
@@ -120,11 +130,11 @@ async function saveAttachments(files, ticketId, messageId, tenant, userId) {
       id: result.insertId,
       ticket_id: ticketId,
       message_id: messageId || null,
-      original_name: file.originalname || file.filename,
-      stored_name: file.filename,
+      original_name: file.originalname || stored.filename,
+      stored_name: storedName,
       mime_type: file.mimetype,
       file_size: file.size || 0,
-      url: `/api/uploads/support/${file.filename}`,
+      url: attachmentUrl(storedName),
     });
   }
   return saved;
@@ -470,7 +480,7 @@ export const getTicket = async (req, res) => {
 
     const mappedAtt = attachments.map((a) => ({
       ...a,
-      url: `/api/uploads/support/${a.stored_name}`,
+      url: attachmentUrl(a.stored_name),
     }));
 
     const [history] = await db.query(
@@ -717,7 +727,10 @@ export const downloadAttachment = async (req, res) => {
     const att = rows[0];
     if (!canViewTicket(req.user, att)) return fail(res, 'Access denied', 403);
 
-    const filePath = path.join(supportUploadDir, att.stored_name);
+    if (/^https?:\/\//i.test(String(att.stored_name || ''))) {
+      return res.redirect(att.stored_name);
+    }
+    const filePath = path.join(__dirname, '..', 'uploads', 'support', att.stored_name);
     if (!fs.existsSync(filePath)) return fail(res, 'File missing', 404);
     res.setHeader('Content-Type', att.mime_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename="${att.original_name.replace(/"/g, '')}"`);

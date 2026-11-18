@@ -29,6 +29,7 @@ import { upload } from '../middleware/upload';
 import { companyUpload } from '../middleware/companyUpload';
 import { staffUpload } from '../middleware/staffUpload';
 import { supportUpload } from '../middleware/supportUpload';
+import { storeUpload, makeFilename } from '../utils/s3Storage';
 import { apiHomeHtml, wantsHtml } from '../utils/apiScreens';
 
 router.get('/', (req, res) => {
@@ -160,12 +161,25 @@ router.post(
   requireAuth,
   requirePanelUser,
   upload.single('image'),
-  (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No image uploaded' });
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No image uploaded' });
+      }
+      const filename = makeFilename('product', req.file.originalname, '.jpg');
+      const stored = await storeUpload(req.file, 'products', filename);
+      return res.json({
+        success: true,
+        data: { url: stored.url, filename: stored.filename, storage: stored.storage },
+        message: 'Image uploaded',
+      });
+    } catch (err: any) {
+      console.error('product-image upload:', err);
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Image upload failed',
+      });
     }
-    const url = `/api/uploads/products/${req.file.filename}`;
-    return res.json({ success: true, data: { url, filename: req.file.filename }, message: 'Image uploaded' });
   }
 );
 router.post(
@@ -173,12 +187,25 @@ router.post(
   requireAuth,
   requirePanelUser,
   staffUpload.single('image'),
-  (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No image uploaded' });
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No image uploaded' });
+      }
+      const filename = makeFilename('staff', req.file.originalname, '.jpg');
+      const stored = await storeUpload(req.file, 'staff', filename);
+      return res.json({
+        success: true,
+        data: { url: stored.url, filename: stored.filename, storage: stored.storage },
+        message: 'Photo uploaded',
+      });
+    } catch (err: any) {
+      console.error('staff-photo upload:', err);
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Photo upload failed',
+      });
     }
-    const url = `/api/uploads/staff/${req.file.filename}`;
-    return res.json({ success: true, data: { url, filename: req.file.filename }, message: 'Photo uploaded' });
   }
 );
 router.post(
@@ -186,22 +213,32 @@ router.post(
   requireAuth,
   requireRight('company', 'edit'),
   companyUpload.single('file'),
-  (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No file uploaded' });
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No file uploaded' });
+      }
+      const filename = makeFilename('company', req.file.originalname);
+      const stored = await storeUpload(req.file, 'company', filename);
+      return res.json({
+        success: true,
+        data: {
+          url: stored.url,
+          filename: stored.filename,
+          original_name: req.file.originalname,
+          mime_type: req.file.mimetype,
+          size: req.file.size,
+          storage: stored.storage,
+        },
+        message: 'Document uploaded',
+      });
+    } catch (err: any) {
+      console.error('company-document upload:', err);
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Document upload failed',
+      });
     }
-    const url = `/api/uploads/company/${req.file.filename}`;
-    return res.json({
-      success: true,
-      data: {
-        url,
-        filename: req.file.filename,
-        original_name: req.file.originalname,
-        mime_type: req.file.mimetype,
-        size: req.file.size,
-      },
-      message: 'Document uploaded',
-    });
   }
 );
 router.get('/panel/categories', requireAuth, requireRight('product', 'view'), admin.categories);

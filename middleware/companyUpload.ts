@@ -1,16 +1,12 @@
 /**
  * Author: Nandhakumar
  * Version: 0.0.1
- * Desc: Multer upload for company documents (PDF, images, office)
- * Edit Date: 2026-11-14
+ * Desc: Multer company document upload (memory → S3/local)
+ * Edit Date: 2026-11-18
  */
 
 import path from 'path';
-import fs from 'fs';
 import multer from 'multer';
-
-const uploadDir = path.join(__dirname, '..', 'uploads', 'company');
-fs.mkdirSync(uploadDir, { recursive: true });
 
 const ALLOWED_EXT = new Set([
   '.pdf',
@@ -37,17 +33,8 @@ const ALLOWED_MIME = new Set([
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 ]);
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase() || '.bin';
-    const safeExt = ALLOWED_EXT.has(ext) ? ext : '.bin';
-    cb(null, `company_${Date.now()}_${Math.round(Math.random() * 1e6)}${safeExt}`);
-  },
-});
-
 const companyUpload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
@@ -58,4 +45,4 @@ const companyUpload = multer({
   },
 });
 
-export { companyUpload, uploadDir as companyUploadDir };
+export { companyUpload };

@@ -1,16 +1,11 @@
 /**
  * Author: Nandhakumar
  * Version: 0.0.1
- * Desc: Multer support ticket attachment upload middleware
- * Edit Date: 2026-11-12
+ * Desc: Multer support attachment upload (memory → S3/local)
+ * Edit Date: 2026-11-18
  */
 
-import path from 'path';
-import fs from 'fs';
 import multer from 'multer';
-
-const uploadDir = path.join(__dirname, '..', 'uploads', 'support');
-fs.mkdirSync(uploadDir, { recursive: true });
 
 const ALLOWED = new Set([
   'image/jpeg',
@@ -20,21 +15,8 @@ const ALLOWED = new Set([
   'application/pdf',
 ]);
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase() || '';
-    const safeExt = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.pdf'].includes(ext)
-      ? ext
-      : file.mimetype === 'application/pdf'
-        ? '.pdf'
-        : '.bin';
-    cb(null, `support_${Date.now()}_${Math.round(Math.random() * 1e6)}${safeExt}`);
-  },
-});
-
 const supportUpload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024, files: 5 },
   fileFilter: (_req, file, cb) => {
     if (!ALLOWED.has(file.mimetype)) {
@@ -44,4 +26,4 @@ const supportUpload = multer({
   },
 });
 
-export { supportUpload, uploadDir as supportUploadDir };
+export { supportUpload };
