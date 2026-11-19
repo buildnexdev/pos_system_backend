@@ -320,9 +320,9 @@ export const login = async (req, res) => {
         ? `Login successful — please change your password (required every ${PASSWORD_MAX_AGE_DAYS} days)`
         : 'Login successful'
     );
-  } catch (err) {
-    console.error(err);
-    return fail(res, 'Login failed', 500);
+  } catch (err: any) {
+    console.error('Login error:', err);
+    return fail(res, err?.message || 'Login failed', 500);
   }
 };
 

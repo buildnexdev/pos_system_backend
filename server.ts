@@ -17,9 +17,25 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+const clientUrls = (process.env.CLIENT_URL || 'http://localhost:5173,https://pos.buildnexdev.in')
+  .split(',')
+  .map((u) => u.trim().replace(/\/$/, ''));
+
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: (origin, callback) => {
+      // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+      if (!origin) return callback(null, true);
+      const cleanOrigin = origin.replace(/\/$/, '');
+      if (clientUrls.includes(cleanOrigin) || clientUrls.includes('*')) {
+        return callback(null, true);
+      }
+      // If client origin is from buildnexdev.in or localhost, allow it
+      if (/^https?:\/\/([a-z0-9-]+\.)?buildnexdev\.in$/i.test(cleanOrigin) || cleanOrigin.includes('localhost')) {
+        return callback(null, true);
+      }
+      return callback(null, true);
+    },
     credentials: true,
   })
 );
