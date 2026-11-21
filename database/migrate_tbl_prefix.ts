@@ -140,6 +140,7 @@ const TABLES: TableRename[] = [
       { from: 'from_warehouse_id', to: 'fromWarehouseID' },
       { from: 'to_warehouse_id', to: 'toWarehouseID' },
       { from: 'variant_id', to: 'productVariantID' },
+      { from: 'supplier_id', to: 'supplierID' },
       { from: 'created_by', to: 'createdByUserID' },
       { from: 'order_id', to: 'orderID' },
     ],

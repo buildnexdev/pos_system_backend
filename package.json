@@ -26,7 +26,11 @@
     "db:migrate-invoice-agreement": "tsx database/migrate_invoice_agreement.ts",
     "db:migrate-role-company": "tsx database/migrate_role_company.ts",
     "db:migrate-auth-session": "tsx database/migrate_auth_session.ts",
-    "db:migrate-auth-otp": "tsx database/migrate_auth_otp.ts"
+    "db:migrate-auth-otp": "tsx database/migrate_auth_otp.ts",
+    "db:migrate-bank-address": "tsx database/migrate_bank_address.ts",
+    "db:migrate-brands": "tsx database/migrate_brands.ts",
+    "db:migrate-material-types": "tsx database/migrate_material_types.ts",
+    "db:migrate-customer-details": "tsx database/migrate_customer_details.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1171.0",

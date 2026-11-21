@@ -23,17 +23,21 @@ const MODULES: PanelModule[] = [
   { key: 'role', label: 'Role' },
   { key: 'access_control', label: 'Access Control' },
   { key: 'staff', label: 'Staff' },
+  { key: 'branch', label: 'Branch' },
+  { key: 'warehouse', label: 'Warehouse' },
   { key: 'company', label: 'Company' },
   { key: 'payment_history', label: 'Payment History' },
   { key: 'invoice_agreement', label: 'Invoice & Agreement' },
   { key: 'manage_ticket', label: 'Manage Ticket' },
   { key: 'product_type', label: 'Product Type' },
+  { key: 'category', label: 'Category' },
+  { key: 'brand', label: 'Brand' },
+  { key: 'material_type', label: 'Material Type' },
   { key: 'supplier', label: 'Supplier' },
-  { key: 'branch', label: 'Branch' },
-  { key: 'warehouse', label: 'Warehouse' },
   { key: 'catalog', label: 'Products' },
   { key: 'product', label: 'Stock' },
   { key: 'order', label: 'Order' },
+  { key: 'order_tracking', label: 'Order Tracking' },
   { key: 'customer', label: 'Customer' },
   { key: 'payment_gateway', label: 'Payment Gateway' },
   { key: 'billing', label: 'POS Billing' },
@@ -51,6 +55,17 @@ const SUPER_ADMIN_MODULE_KEYS = new Set([
   'manage_ticket',
   'support', // Manage Ticket APIs
 ]);
+
+/** Modules that must not appear in staff Access Control (Super Admin pages only) */
+const STAFF_ACL_EXCLUDED_KEYS = new Set([
+  'company',
+  'payment_history',
+  'invoice_agreement',
+  'manage_ticket',
+]);
+
+/** Modules where only View applies (no create / edit / delete) */
+const VIEW_ONLY_MODULE_KEYS = new Set(['dashboard', 'report', 'finance', 'support']);
 
 function fullRights(): ModuleRight[] {
   return MODULES.map((m) => ({
@@ -91,4 +106,12 @@ function companyAdminRights(): ModuleRight[] {
   });
 }
 
-export { MODULES, SUPER_ADMIN_MODULE_KEYS, fullRights, companyOnlyRights, companyAdminRights };
+export {
+  MODULES,
+  SUPER_ADMIN_MODULE_KEYS,
+  STAFF_ACL_EXCLUDED_KEYS,
+  VIEW_ONLY_MODULE_KEYS,
+  fullRights,
+  companyOnlyRights,
+  companyAdminRights,
+};

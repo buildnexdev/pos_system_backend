@@ -11,6 +11,8 @@ export const T = {
   company: 'tblCompany',
   companyDocument: 'tblCompanyDocument',
   category: 'tblCategory',
+  brand: 'tblBrand',
+  materialType: 'tblMaterialType',
   productType: 'tblProductType',
   supplier: 'tblSupplier',
   product: 'tblProduct',

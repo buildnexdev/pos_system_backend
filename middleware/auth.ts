@@ -153,6 +153,26 @@ async function getUserRights(user?: AuthUser | null) {
   return rows;
 }
 
+const RIGHT_FIELD = {
+  view: 'can_view',
+  create: 'can_create',
+  edit: 'can_edit',
+  delete: 'can_delete',
+} as const;
+
+async function staffHasRight(
+  user: AuthUser,
+  moduleKey: string,
+  action: 'view' | 'create' | 'edit' | 'delete'
+) {
+  const field = RIGHT_FIELD[action] || 'can_view';
+  const [rows] = await db.query(
+    `SELECT ${field} AS allowed FROM tblUserRight WHERE userID = :userId AND module_key = :moduleKey LIMIT 1`,
+    { userId: user.id, moduleKey }
+  );
+  return Boolean(rows.length && rows[0].allowed);
+}
+
 function requireRight(moduleKey: string, action: 'view' | 'create' | 'edit' | 'delete' = 'view'): RequestHandler {
   return async (req, res, next) => {
     try {
@@ -187,25 +207,59 @@ function requireRight(moduleKey: string, action: 'view' | 'create' | 'edit' | 'd
         return res.status(403).json({ success: false, message: 'Access denied' });
       }
 
-      const field =
-        (
-          {
-            view: 'can_view',
-            create: 'can_create',
-            edit: 'can_edit',
-            delete: 'can_delete',
-          } as const
-        )[action] || 'can_view';
-
-      const [rows] = await db.query(
-        `SELECT ${field} AS allowed FROM tblUserRight WHERE userID = :userId AND module_key = :moduleKey LIMIT 1`,
-        { userId: req.user.id, moduleKey }
-      );
-
-      if (!rows.length || !rows[0].allowed) {
+      if (!(await staffHasRight(req.user, moduleKey, action))) {
         return res.status(403).json({ success: false, message: `No ${action} right for ${moduleKey}` });
       }
       next();
+    } catch (err) {
+      console.error(err);
+      return res.status(500).json({ success: false, message: 'Rights check failed' });
+    }
+  };
+}
+
+/** Allow if staff has the action on any of the given modules (e.g. catalog or product). */
+function requireAnyRight(
+  moduleKeys: string[],
+  action: 'view' | 'create' | 'edit' | 'delete' = 'view'
+): RequestHandler {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({ success: false, message: 'Authentication required' });
+      }
+      if (req.headers['x-company-id'] || req.headers['x-companyid']) {
+        return res.status(400).json({ success: false, message: 'Company override headers are not allowed' });
+      }
+
+      if (isSuperAdmin(req.user)) {
+        if (!moduleKeys.some((k) => SUPER_ADMIN_MODULE_KEYS.has(k))) {
+          return res.status(403).json({ success: false, message: 'Super Admin access limited to platform pages' });
+        }
+        return next();
+      }
+
+      if (moduleKeys.every((k) => SUPER_ADMIN_MODULE_KEYS.has(k) && k !== 'support')) {
+        return res.status(403).json({ success: false, message: 'Only Super Admin can access this module' });
+      }
+
+      if (!getCompanyId(req.user)) {
+        return res.status(403).json({ success: false, message: 'Company context required' });
+      }
+
+      if (isCompanyAdmin(req.user) || req.user.role === 'admin') return next();
+
+      if (req.user.role !== 'staff') {
+        return res.status(403).json({ success: false, message: 'Access denied' });
+      }
+
+      for (const moduleKey of moduleKeys) {
+        if (await staffHasRight(req.user, moduleKey, action)) return next();
+      }
+      return res.status(403).json({
+        success: false,
+        message: `No ${action} right for ${moduleKeys.join(' / ')}`,
+      });
     } catch (err) {
       console.error(err);
       return res.status(500).json({ success: false, message: 'Rights check failed' });
@@ -220,5 +274,6 @@ export {
   requireCompany,
   optionalAuth,
   requireRight,
+  requireAnyRight,
   getUserRights,
 };

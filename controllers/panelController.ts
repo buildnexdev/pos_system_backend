@@ -7,8 +7,12 @@
 
 import bcrypt from 'bcryptjs';
 import db from '../config/db';
-import { MODULES } from '../config/modules';
-import { DEFAULT_ROLES } from '../config/roles';
+import { MODULES, STAFF_ACL_EXCLUDED_KEYS, VIEW_ONLY_MODULE_KEYS } from '../config/modules';
+import {
+  ASSIGNABLE_DEFAULT_ROLES,
+  DEFAULT_ROLES,
+  isAssignableStaffRoleLevel,
+} from '../config/roles';
 import {
   USER_ROLE_JOIN,
   SQL_PANEL_USER,
@@ -107,9 +111,11 @@ export const listStaff = async (req, res) => {
 
     const [staff] = await db.query(
       `SELECT u.userID AS id, u.name, u.email, u.phone, u.address, u.city, u.state, u.pincode,
-              u.roleID, u.is_active, u.created_at, r.RoleCode, r.RoleName, r.Level
+              u.roleID, u.is_active, u.created_at, r.RoleCode, r.RoleName, r.Level,
+              p.photo_url, p.employee_code
        FROM tblUser u
        ${USER_ROLE_JOIN}
+       LEFT JOIN tblStaffProfile p ON p.userID = u.userID
        WHERE ${whereSql}
        ORDER BY u.created_at DESC
        LIMIT ${limit} OFFSET ${offset}`,
@@ -177,21 +183,33 @@ export const getStaff = async (req, res) => {
     rows[0].role = accessRoleFromRow(rows[0]);
 
     const [education] = await db.query(
-      'SELECT * FROM tblStaffEducation WHERE userID = :id ORDER BY id DESC',
+      'SELECT * FROM tblStaffEducation WHERE userID = :id ORDER BY staffEducationID DESC',
       { id: req.params.id }
-    ).catch(() => [[]]);
+    ).catch((err) => {
+      console.warn('tblStaffEducation load:', err.message);
+      return [[]];
+    });
     const [experience] = await db.query(
-      'SELECT * FROM tblStaffExperience WHERE userID = :id ORDER BY id DESC',
+      'SELECT * FROM tblStaffExperience WHERE userID = :id ORDER BY staffExperienceID DESC',
       { id: req.params.id }
-    ).catch(() => [[]]);
+    ).catch((err) => {
+      console.warn('tblStaffExperience load:', err.message);
+      return [[]];
+    });
     const [documents] = await db.query(
-      'SELECT * FROM tblStaffDocument WHERE userID = :id ORDER BY id DESC',
+      'SELECT * FROM tblStaffDocument WHERE userID = :id ORDER BY staffDocumentID DESC',
       { id: req.params.id }
-    ).catch(() => [[]]);
+    ).catch((err) => {
+      console.warn('tblStaffDocument load:', err.message);
+      return [[]];
+    });
     const [history] = await db.query(
       'SELECT * FROM tblStaffHistory WHERE userID = :id ORDER BY created_at DESC',
       { id: req.params.id }
-    ).catch(() => [[]]);
+    ).catch((err) => {
+      console.warn('tblStaffHistory load:', err.message);
+      return [[]];
+    });
     const [profiles] = await db.query(
       'SELECT * FROM tblStaffProfile WHERE userID = :id LIMIT 1',
       { id: req.params.id }
@@ -228,20 +246,28 @@ export const saveStaff = async (req, res) => {
     const {
       name, email, phone, password, is_active,
       address, city, state, pincode,
-      education = [], experience = [], documents = [],
       profile = null,
     } = req.body;
+    const hasEducation = Object.prototype.hasOwnProperty.call(req.body, 'education');
+    const hasExperience = Object.prototype.hasOwnProperty.call(req.body, 'experience');
+    const hasDocuments = Object.prototype.hasOwnProperty.call(req.body, 'documents');
+    const education = hasEducation ? req.body.education : undefined;
+    const experience = hasExperience ? req.body.experience : undefined;
+    const documents = hasDocuments ? req.body.documents : undefined;
     if (!name || !email) return fail(res, 'Name and email required');
 
-    // Prefer company role from Office details; never promote to admin login
+    // Prefer company role from Office details; never assign Owner/Admin (L1–L2)
     let roleID = Number(req.body.roleID || req.body.role_id || 0) || 0;
     if (roleID) {
       const [okRole] = await db.query(
-        `SELECT roleID FROM tblRole
+        `SELECT roleID, Level FROM tblRole
          WHERE roleID = :id AND companyID = :companyID AND IsActive = 1 LIMIT 1`,
         { id: roleID, companyID }
       );
       if (!okRole.length) return fail(res, 'Invalid role for this company', 400);
+      if (!isAssignableStaffRoleLevel(okRole[0].Level)) {
+        return fail(res, 'Super Admin and Admin roles cannot be assigned to staff', 400);
+      }
     } else {
       roleID = await getRoleId('staff', companyID);
     }
@@ -308,6 +334,13 @@ export const saveStaff = async (req, res) => {
     } else {
       if (!password) return fail(res, 'Password required for new staff');
       if (String(password).length < 6) return fail(res, 'Password must be at least 6 characters', 400);
+      const [dupEmail] = await db.query(
+        `SELECT userID FROM tblUser WHERE LOWER(email) = LOWER(:email) LIMIT 1`,
+        { email: String(email).trim() }
+      );
+      if (dupEmail.length) {
+        return fail(res, 'Email already registered — use a different login email', 409);
+      }
       const hash = await bcrypt.hash(password, 10);
       const [result] = await db.query(
         `INSERT INTO tblUser
@@ -336,13 +369,13 @@ export const saveStaff = async (req, res) => {
         `INSERT INTO tblStaffProfile (
           userID, employee_code, initial_name, date_of_birth, gender, blood_group, marital_status,
           father_name, mother_name, aadhaar, pan, emergency_name, emergency_phone, photo_url,
-          bank_name, account_holder, account_number, ifsc_code, bank_branch,
+          bank_name, account_holder, account_number, ifsc_code, bank_branch, bank_address,
           department, designation, join_date, employment_type, work_location, reporting_to,
           landmark, country
         ) VALUES (
           :userID, :employee_code, :initial_name, :date_of_birth, :gender, :blood_group, :marital_status,
           :father_name, :mother_name, :aadhaar, :pan, :emergency_name, :emergency_phone, :photo_url,
-          :bank_name, :account_holder, :account_number, :ifsc_code, :bank_branch,
+          :bank_name, :account_holder, :account_number, :ifsc_code, :bank_branch, :bank_address,
           :department, :designation, :join_date, :employment_type, :work_location, :reporting_to,
           :landmark, :country
         )
@@ -364,6 +397,7 @@ export const saveStaff = async (req, res) => {
           account_number=VALUES(account_number),
           ifsc_code=VALUES(ifsc_code),
           bank_branch=VALUES(bank_branch),
+          bank_address=VALUES(bank_address),
           department=VALUES(department),
           designation=VALUES(designation),
           join_date=VALUES(join_date),
@@ -392,6 +426,7 @@ export const saveStaff = async (req, res) => {
           account_number: profile.account_number || null,
           ifsc_code: profile.ifsc_code || null,
           bank_branch: profile.bank_branch || null,
+          bank_address: profile.bank_address || null,
           department: profile.department || null,
           designation: profile.designation || null,
           join_date: profile.join_date || null,
@@ -411,8 +446,8 @@ export const saveStaff = async (req, res) => {
       ).catch(() => null);
     }
 
-    // Replace education / experience / documents when arrays provided
-    if (Array.isArray(education)) {
+    // Replace education / experience / documents only when that section is sent
+    if (hasEducation && Array.isArray(education)) {
       await db.query('DELETE FROM tblStaffEducation WHERE userID = :id', { id: staffId }).catch(() => null);
       for (const row of education) {
         if (!row.degree || !row.institution) continue;
@@ -431,7 +466,7 @@ export const saveStaff = async (req, res) => {
       }
     }
 
-    if (Array.isArray(experience)) {
+    if (hasExperience && Array.isArray(experience)) {
       await db.query('DELETE FROM tblStaffExperience WHERE userID = :id', { id: staffId }).catch(() => null);
       for (const row of experience) {
         if (!row.company || !row.designation) continue;
@@ -450,7 +485,7 @@ export const saveStaff = async (req, res) => {
       }
     }
 
-    if (Array.isArray(documents)) {
+    if (hasDocuments && Array.isArray(documents)) {
       await db.query('DELETE FROM tblStaffDocument WHERE userID = :id', { id: staffId }).catch(() => null);
       for (const row of documents) {
         if (!row.doc_type || !row.doc_name || !row.file_url) continue;
@@ -468,10 +503,13 @@ export const saveStaff = async (req, res) => {
     }
 
     return ok(res, { id: staffId }, isUpdate ? 'Staff updated' : 'Staff created', isUpdate ? 200 : 201);
-  } catch (err) {
+  } catch (err: any) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
-    return fail(res, 'Could not save staff (email may exist)', 500);
+    if (err?.code === 'ER_DUP_ENTRY' || String(err?.message || '').includes('Duplicate')) {
+      return fail(res, 'Email already registered — use a different login email', 409);
+    }
+    return fail(res, err?.message || 'Could not save staff', 500);
   }
 };
 
@@ -617,10 +655,11 @@ export const listRoles = async (req, res) => {
        ORDER BY Level ASC, roleID ASC`,
       { companyID }
     );
-    const roles = rows.map(mapTblRole);
+    // Hide Owner / Super Admin (L1) and Admin / Manager (L2) from Roles UI
+    const roles = rows.map(mapTblRole).filter((r) => isAssignableStaffRoleLevel(r.level));
     const nextSeq = roles.length + 1;
 
-    const levels = DEFAULT_ROLES.map((r) => ({
+    const levels = ASSIGNABLE_DEFAULT_ROLES.map((r) => ({
       level: r.level,
       label: `Level ${r.level}[${r.name}]`,
       name: r.name,
@@ -646,6 +685,9 @@ export const saveRole = async (req, res) => {
     if (!name) return fail(res, 'Role name is required');
     if (!Number.isFinite(level) || level < 1 || level > 7) {
       return fail(res, 'Please select a valid level (1-7)');
+    }
+    if (!isAssignableStaffRoleLevel(level)) {
+      return fail(res, 'Super Admin and Admin levels are reserved and cannot be created or edited here', 400);
     }
 
     const levelMeta = DEFAULT_ROLES.find((r) => r.level === level) || DEFAULT_ROLES[DEFAULT_ROLES.length - 1];
@@ -758,7 +800,8 @@ export const staffOptions = async (req, res) => {
               r.RoleCode, r.Level
        FROM tblUser u
        ${USER_ROLE_JOIN}
-       WHERE ${SQL_PANEL_USER} AND u.companyID = :companyID AND u.is_active = 1
+       WHERE ${SQL_PANEL_USER} AND ${SQL_STAFF_LOGIN_ONLY}
+         AND u.companyID = :companyID AND u.is_active = 1
        ORDER BY u.name`,
       { companyID }
     );
@@ -791,7 +834,7 @@ export const listUserRoleAssignments = async (req, res) => {
     const [roles] = await db.query(
       `SELECT roleID AS id, RoleName AS name, RoleCode AS code, Level AS level, Color AS color, IsDefault AS is_default
        FROM tblRole
-       WHERE IsActive = 1 AND companyID = :companyID
+       WHERE IsActive = 1 AND companyID = :companyID AND Level >= 3 AND Level < 90
        ORDER BY Level ASC, roleID ASC`,
       { companyID }
     );
@@ -821,11 +864,14 @@ export const assignUserRole = async (req, res) => {
 
     if (roleId != null) {
       const [roles] = await db.query(
-        `SELECT roleID FROM tblRole
+        `SELECT roleID, Level FROM tblRole
          WHERE roleID = :id AND IsActive = 1 AND companyID = :companyID`,
         { id: roleId, companyID }
       );
       if (!roles.length) return fail(res, 'Role not found for this company', 404);
+      if (!isAssignableStaffRoleLevel(roles[0].Level)) {
+        return fail(res, 'Super Admin and Admin roles cannot be assigned to staff', 400);
+      }
     }
 
     await db.query(`UPDATE tblUser SET roleID = :roleId WHERE userID = :id AND companyID = :companyID`, {
@@ -862,19 +908,27 @@ export const getRights = async (req, res) => {
       { userId }
     );
 
-    const mapped = MODULES.map((m) => {
+    // Super Admin pages are not assignable; Help & Support remains assignable
+    const staffModules = MODULES.filter((m) => !STAFF_ACL_EXCLUDED_KEYS.has(m.key));
+    const mapped = staffModules.map((m) => {
       const found = rights.find((r) => r.module_key === m.key);
+      const viewOnly = VIEW_ONLY_MODULE_KEYS.has(m.key);
+      const canView = found ? !!Number(found.can_view) : false;
+      const canCreate = found ? !!Number(found.can_create) : false;
+      const canEdit = found ? !!Number(found.can_edit) : false;
+      const canDelete = found ? !!Number(found.can_delete) : false;
       return {
         module_key: m.key,
         label: m.label,
-        can_view: found ? !!found.can_view : accessRole === 'admin',
-        can_create: found ? !!found.can_create : accessRole === 'admin',
-        can_edit: found ? !!found.can_edit : accessRole === 'admin',
-        can_delete: found ? !!found.can_delete : accessRole === 'admin'
+        view_only: viewOnly,
+        can_view: canView,
+        can_create: viewOnly ? false : canCreate,
+        can_edit: viewOnly ? false : canEdit,
+        can_delete: viewOnly ? false : canDelete,
       };
     });
 
-    return ok(res, { user: userRows[0], rights: mapped, modules: MODULES });
+    return ok(res, { user: userRows[0], rights: mapped, modules: staffModules });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
@@ -889,25 +943,29 @@ export const saveRights = async (req, res) => {
     const userId = Number(req.params.userId);
     const [owned] = await connection.query(
       `SELECT u.userID AS id FROM tblUser u ${USER_ROLE_JOIN}
-       WHERE u.userID = :id AND u.companyID = :companyID AND ${SQL_PANEL_USER}`,
+       WHERE u.userID = :id AND u.companyID = :companyID
+         AND ${SQL_PANEL_USER} AND ${SQL_STAFF_LOGIN_ONLY}`,
       { id: userId, companyID }
     );
     if (!owned.length) return fail(res, 'Staff not found', 404);
-    const rights = Array.isArray(req.body.rights) ? req.body.rights : [];
+    const rights = (Array.isArray(req.body.rights) ? req.body.rights : []).filter(
+      (r: any) => r?.module_key && !STAFF_ACL_EXCLUDED_KEYS.has(String(r.module_key))
+    );
     await connection.beginTransaction();
     await connection.query('DELETE FROM tblUserRight WHERE userID = ?', [userId]);
     for (const r of rights) {
+      const key = String(r.module_key);
+      const viewOnly = VIEW_ONLY_MODULE_KEYS.has(key);
+      const canView = r.can_view ? 1 : 0;
+      const canCreate = viewOnly ? 0 : r.can_create ? 1 : 0;
+      const canEdit = viewOnly ? 0 : r.can_edit ? 1 : 0;
+      const canDelete = viewOnly ? 0 : r.can_delete ? 1 : 0;
+      // Skip fully empty rows
+      if (!canView && !canCreate && !canEdit && !canDelete) continue;
       await connection.query(
         `INSERT INTO tblUserRight (userID, module_key, can_view, can_create, can_edit, can_delete)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [
-          userId,
-          r.module_key,
-          r.can_view ? 1 : 0,
-          r.can_create ? 1 : 0,
-          r.can_edit ? 1 : 0,
-          r.can_delete ? 1 : 0
-        ]
+        [userId, key, canView || (canCreate || canEdit || canDelete ? 1 : 0), canCreate, canEdit, canDelete]
       );
     }
     await connection.commit();
@@ -928,7 +986,7 @@ export const saveRights = async (req, res) => {
 const COMPANY_SELECT = `
   SELECT c.companyID AS id, c.companyID, c.name, c.code, c.legal_name, c.email, c.phone, c.alternate_phone,
          c.website, c.address, c.city, c.state, c.pincode, c.country, c.gstin, c.pan, c.cin, c.logo_url, c.notes,
-         c.bank_name, c.account_holder, c.account_number, c.ifsc_code, c.bank_branch,
+         c.bank_name, c.account_holder, c.account_number, c.ifsc_code, c.bank_branch, c.bank_address,
          c.is_active, c.created_at, c.updated_at,
          u.userID AS admin_user_id, u.name AS admin_username, u.email AS admin_email,
          u.phone AS admin_phone, u.roleID AS admin_role_id, r.RoleCode AS admin_role_code,
@@ -1019,6 +1077,7 @@ export const saveCompany = async (req, res) => {
       account_number: req.body.account_number || null,
       ifsc_code: req.body.ifsc_code || null,
       bank_branch: req.body.bank_branch || null,
+      bank_address: req.body.bank_address || null,
       notes: req.body.notes || null,
       is_active: req.body.is_active === false || req.body.is_active === 0 ? 0 : 1,
     };
@@ -1054,7 +1113,7 @@ export const saveCompany = async (req, res) => {
          state=:state, pincode=:pincode, country=:country, gstin=:gstin, pan=:pan, cin=:cin,
          logo_url=:logo_url, bank_name=:bank_name, account_holder=:account_holder,
          account_number=:account_number, ifsc_code=:ifsc_code, bank_branch=:bank_branch,
-         notes=:notes, is_active=:is_active
+         bank_address=:bank_address, notes=:notes, is_active=:is_active
          WHERE companyID=:id`,
         { ...data, id: companyId }
       );
@@ -1063,11 +1122,11 @@ export const saveCompany = async (req, res) => {
         `INSERT INTO tblCompany
          (name, code, legal_name, email, phone, alternate_phone, website, address, city, state,
           pincode, country, gstin, pan, cin, logo_url, bank_name, account_holder, account_number,
-          ifsc_code, bank_branch, notes, is_active)
+          ifsc_code, bank_branch, bank_address, notes, is_active)
          VALUES
          (:name, :code, :legal_name, :email, :phone, :alternate_phone, :website, :address, :city, :state,
           :pincode, :country, :gstin, :pan, :cin, :logo_url, :bank_name, :account_holder, :account_number,
-          :ifsc_code, :bank_branch, :notes, :is_active)`,
+          :ifsc_code, :bank_branch, :bank_address, :notes, :is_active)`,
         data
       );
       companyId = result.insertId;
@@ -1278,6 +1337,8 @@ export const saveSupplier = async (req, res) => {
       bank_account_name: req.body.bank_account_name || null,
       bank_account_no: req.body.bank_account_no || null,
       bank_ifsc: req.body.bank_ifsc || null,
+      bank_branch: req.body.bank_branch || null,
+      bank_address: req.body.bank_address || null,
       website: req.body.website || null,
       contact_person: req.body.contact_person || null,
       notes: req.body.notes || null,
@@ -1294,6 +1355,7 @@ export const saveSupplier = async (req, res) => {
          gstin=:gstin, pan=:pan, company_type=:company_type, payment_terms=:payment_terms,
          credit_days=:credit_days, credit_limit=:credit_limit, bank_name=:bank_name,
          bank_account_name=:bank_account_name, bank_account_no=:bank_account_no, bank_ifsc=:bank_ifsc,
+         bank_branch=:bank_branch, bank_address=:bank_address,
          website=:website, contact_person=:contact_person, notes=:notes, is_active=:is_active
          WHERE supplierID=:id AND companyID=:companyID`,
         { ...data, id }
@@ -1310,11 +1372,13 @@ export const saveSupplier = async (req, res) => {
       `INSERT INTO tblSupplier
        (name, code, phone, alternate_phone, email, address, city, state, pincode, country,
         gstin, pan, company_type, payment_terms, credit_days, credit_limit, bank_name,
-        bank_account_name, bank_account_no, bank_ifsc, website, contact_person, notes, is_active, companyID)
+        bank_account_name, bank_account_no, bank_ifsc, bank_branch, bank_address,
+        website, contact_person, notes, is_active, companyID)
        VALUES
        (:name, :code, :phone, :alternate_phone, :email, :address, :city, :state, :pincode, :country,
         :gstin, :pan, :company_type, :payment_terms, :credit_days, :credit_limit, :bank_name,
-        :bank_account_name, :bank_account_no, :bank_ifsc, :website, :contact_person, :notes, :is_active, :companyID)`,
+        :bank_account_name, :bank_account_no, :bank_ifsc, :bank_branch, :bank_address,
+        :website, :contact_person, :notes, :is_active, :companyID)`,
       { ...data, code }
     );
     return ok(res, { id: result.insertId, code }, 'Supplier created', 201);
@@ -1359,7 +1423,8 @@ export const listProductTypes = async (req, res) => {
 export const saveProductType = async (req, res) => {
   try {
     const companyID = requireCompanyId(req.user);
-    const name = req.body.name;
+    const name = String(req.body.name || '').trim();
+    if (!name) return fail(res, 'Product type name is required', 400);
     const slug = slugify(req.body.slug || name);
     const description = req.body.description || '';
     const is_active = req.body.is_active === false || req.body.is_active === 0 ? 0 : 1;
@@ -1368,13 +1433,13 @@ export const saveProductType = async (req, res) => {
         'UPDATE tblProductType SET name=:name, slug=:slug, description=:description, is_active=:is_active WHERE productTypeID=:id AND companyID=:companyID',
         { name, slug, description, is_active, id: req.params.id, companyID }
       );
-    } else {
-      await db.query(
-        'INSERT INTO tblProductType (name, slug, description, is_active, companyID) VALUES (:name, :slug, :description, :is_active, :companyID)',
-        { name, slug, description, is_active, companyID }
-      );
+      return ok(res, { id: Number(req.params.id), name }, 'Product type updated');
     }
-    return ok(res, {}, 'Product type saved');
+    const [result] = await db.query(
+      'INSERT INTO tblProductType (name, slug, description, is_active, companyID) VALUES (:name, :slug, :description, :is_active, :companyID)',
+      { name, slug, description, is_active, companyID }
+    );
+    return ok(res, { id: result.insertId, name }, 'Product type created', 201);
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
@@ -1467,15 +1532,105 @@ export const deleteGateway = async (req, res) => {
 export const listBillings = async (req, res) => {
   try {
     const companyID = requireCompanyId(req.user);
+    const q = String(req.query.q || '').trim();
+    const dateFrom = String(req.query.date_from || req.query.from || '').trim();
+    const dateTo = String(req.query.date_to || req.query.to || '').trim();
+    const params: any = { companyID };
+    let where = 'b.companyID = :companyID';
+    if (q) {
+      where +=
+        ' AND (b.invoice_no LIKE :q OR b.customer_name LIKE :q OR b.customer_email LIKE :q OR CAST(b.billingID AS CHAR) = :qExact OR CAST(b.orderID AS CHAR) = :qExact OR o.order_number LIKE :q)';
+      params.q = `%${q}%`;
+      params.qExact = q;
+    }
+    if (dateFrom) {
+      where += ' AND DATE(b.created_at) >= :dateFrom';
+      params.dateFrom = dateFrom;
+    }
+    if (dateTo) {
+      where += ' AND DATE(b.created_at) <= :dateTo';
+      params.dateTo = dateTo;
+    }
+    // Alias billingID AS id so hydrateId does not pick orderID instead
     const [items] = await db.query(
-      'SELECT * FROM tblBilling WHERE companyID = :companyID ORDER BY created_at DESC',
-      { companyID }
+      `SELECT b.billingID AS id, b.billingID, b.invoice_no, b.orderID, b.customer_name, b.customer_email,
+              b.amount, b.tax, b.total, b.status, b.due_date, b.notes, b.created_at, b.companyID,
+              o.order_number, o.status AS order_status, o.payment_status, o.payment_method, o.order_source
+       FROM tblBilling b
+       LEFT JOIN tblOrder o ON o.orderID = b.orderID AND o.companyID = b.companyID
+       WHERE ${where}
+       ORDER BY b.created_at DESC`,
+      params
     );
     return ok(res, { items });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
     return fail(res, 'Failed to load tblBilling', 500);
+  }
+};
+
+export const getBilling = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const raw = String(req.params.id || '').trim();
+    const id = Number(raw);
+    const [[bill]] = await db.query(
+      `SELECT billingID AS id, billingID, invoice_no, orderID, customer_name, customer_email,
+              amount, tax, total, status, due_date, notes, created_at, companyID
+       FROM tblBilling
+       WHERE companyID = :companyID
+         AND (billingID = :id OR invoice_no = :raw OR orderID = :id)
+       ORDER BY CASE WHEN billingID = :id THEN 0 WHEN invoice_no = :raw THEN 1 ELSE 2 END
+       LIMIT 1`,
+      { id: Number.isFinite(id) ? id : 0, raw, companyID }
+    );
+    if (!bill) return fail(res, 'Invoice not found', 404);
+
+    let order: any = null;
+    let items: any[] = [];
+    let payments: any[] = [];
+    const orderId = bill.orderID || bill.order_id;
+
+    if (orderId) {
+      const [[ord]] = await db.query(
+        `SELECT * FROM tblOrder WHERE orderID = :id AND companyID = :companyID LIMIT 1`,
+        { id: orderId, companyID }
+      );
+      order = ord || null;
+      const [itemRows] = await db.query(
+        `SELECT * FROM tblOrderItem WHERE orderID = :id ORDER BY orderItemID ASC`,
+        { id: orderId }
+      );
+      items = itemRows || [];
+      const [payRows] = await db.query(
+        `SELECT * FROM tblPosPayment WHERE orderID = :id ORDER BY posPaymentID ASC`,
+        { id: orderId }
+      );
+      payments = payRows || [];
+    }
+
+    return ok(res, {
+      invoice: bill,
+      order,
+      items,
+      payments,
+      totals: {
+        subtotal: Number(order?.subtotal || bill.amount || 0),
+        discount: Number(order?.discount || 0),
+        coupon_discount: Number(order?.coupon_discount || 0),
+        tax_amount: Number(order?.tax_amount || bill.tax || 0),
+        additional_charges: Number(order?.shipping_fee || 0),
+        round_off: Number(order?.round_off || 0),
+        total: Number(order?.total || bill.total || 0),
+        amount_received: Number(order?.amount_received || bill.total || 0),
+        change_amount: Number(order?.change_amount || 0),
+      },
+    });
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Failed to load invoice', 500);
   }
 };
 
@@ -1878,6 +2033,11 @@ export const reports = async (req, res) => {
       await ensureOrderBranchColumn();
       const d = dateClause('o');
       const params: any = { ...d.params, companyID };
+      const paymentMethod = String(req.query.payment_method || '').trim();
+      const cashierId = Number(req.query.cashier_id || req.query.cashier || 0) || 0;
+      const cashierName = !cashierId ? String(req.query.cashier_name || req.query.cashier || '').trim() : '';
+      const customerQ = String(req.query.customer || '').trim();
+      // Exclude cancelled from sales report base set (completed sales totals)
       let where = `o.status <> 'cancelled' AND o.companyID = :companyID`;
       if (type === 'day' && !dateFrom && !dateTo) {
         where += ` AND DATE(o.created_at) = CURDATE()`;
@@ -1894,12 +2054,51 @@ export const reports = async (req, res) => {
         where += ` AND o.payment_status = :paymentStatus`;
         params.paymentStatus = paymentStatus;
       }
+      if (paymentMethod) {
+        where += ` AND o.payment_method = :paymentMethod`;
+        params.paymentMethod = paymentMethod;
+      }
       if (q) {
         where += ` AND (
           o.order_number LIKE :q OR o.shipping_name LIKE :q OR o.shipping_phone LIKE :q
           OR o.shipping_city LIKE :q OR b.name LIKE :q OR b.code LIKE :q
+          OR EXISTS (
+            SELECT 1 FROM tblBilling inv
+            WHERE inv.orderID = o.orderID AND inv.invoice_no LIKE :q
+          )
         )`;
         params.q = `%${q}%`;
+      }
+      if (customerQ) {
+        where += ` AND (o.shipping_name LIKE :customerQ OR o.shipping_phone LIKE :customerQ)`;
+        params.customerQ = `%${customerQ}%`;
+      }
+      if (cashierId) {
+        where += ` AND (
+          EXISTS (
+            SELECT 1 FROM tblPosPayment pp
+            WHERE pp.orderID = o.orderID AND pp.receivedByUserID = :cashierId
+          )
+          OR EXISTS (
+            SELECT 1 FROM tblOrderStatusHistory h
+            WHERE h.orderID = o.orderID AND h.createdByUserID = :cashierId
+          )
+        )`;
+        params.cashierId = cashierId;
+      } else if (cashierName) {
+        where += ` AND (
+          EXISTS (
+            SELECT 1 FROM tblPosPayment pp
+            JOIN tblUser cu ON cu.userID = pp.receivedByUserID
+            WHERE pp.orderID = o.orderID AND cu.name LIKE :cashierName
+          )
+          OR EXISTS (
+            SELECT 1 FROM tblOrderStatusHistory h
+            JOIN tblUser cu ON cu.userID = h.createdByUserID
+            WHERE h.orderID = o.orderID AND cu.name LIKE :cashierName
+          )
+        )`;
+        params.cashierName = `%${cashierName}%`;
       }
       const userBranch = getBranchId(req.user);
       const branchParam = Number(req.query.branch_id || req.query.branchID || 0) || 0;
@@ -1929,12 +2128,16 @@ export const reports = async (req, res) => {
           o.subtotal,
           o.discount,
           o.coupon_discount,
+          (COALESCE(o.discount, 0) + COALESCE(o.coupon_discount, 0)) AS total_discount,
           o.tax_amount,
           o.shipping_fee,
           o.round_off,
           o.total,
           o.amount_received,
           o.change_amount,
+          o.refund_amount,
+          o.refund_status,
+          o.refund_completed,
           o.shipping_name,
           o.shipping_phone,
           o.shipping_city,
@@ -1943,6 +2146,37 @@ export const reports = async (req, res) => {
           o.branchID,
           b.name AS branch_name,
           b.code AS branch_code,
+          (
+            SELECT inv.invoice_no FROM tblBilling inv
+            WHERE inv.orderID = o.orderID
+            ORDER BY inv.billingID DESC LIMIT 1
+          ) AS invoice_no,
+          COALESCE(
+            (
+              SELECT pp.receivedByUserID FROM tblPosPayment pp
+              WHERE pp.orderID = o.orderID AND pp.receivedByUserID IS NOT NULL
+              ORDER BY pp.posPaymentID ASC LIMIT 1
+            ),
+            (
+              SELECT h.createdByUserID FROM tblOrderStatusHistory h
+              WHERE h.orderID = o.orderID AND h.createdByUserID IS NOT NULL
+              ORDER BY h.orderStatusHistoryID ASC LIMIT 1
+            )
+          ) AS cashier_id,
+          COALESCE(
+            (
+              SELECT cu.name FROM tblPosPayment pp
+              JOIN tblUser cu ON cu.userID = pp.receivedByUserID
+              WHERE pp.orderID = o.orderID AND pp.receivedByUserID IS NOT NULL
+              ORDER BY pp.posPaymentID ASC LIMIT 1
+            ),
+            (
+              SELECT hu.name FROM tblOrderStatusHistory h
+              JOIN tblUser hu ON hu.userID = h.createdByUserID
+              WHERE h.orderID = o.orderID AND h.createdByUserID IS NOT NULL
+              ORDER BY h.orderStatusHistoryID ASC LIMIT 1
+            )
+          ) AS cashier_name,
           (
             SELECT COUNT(*) FROM tblOrderItem oi WHERE oi.orderID = o.orderID
           ) AS item_count,
@@ -1954,46 +2188,217 @@ export const reports = async (req, res) => {
         LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
         WHERE ${where}
         ORDER BY o.created_at DESC
-        LIMIT 500
+        LIMIT 1000
       `,
         params
-      );
+      ).catch(async (err) => {
+        console.warn('sales report enriched query failed, falling back:', err.message);
+        const [fallback] = await db.query(
+          `
+          SELECT
+            o.orderID AS id, o.order_number, o.order_source, o.status, o.fulfillment_status,
+            o.payment_method, o.payment_status, o.subtotal, o.discount, o.coupon_discount,
+            (COALESCE(o.discount, 0) + COALESCE(o.coupon_discount, 0)) AS total_discount,
+            o.tax_amount, o.shipping_fee, o.round_off, o.total, o.amount_received, o.change_amount,
+            o.refund_amount, o.refund_status, o.refund_completed,
+            o.shipping_name, o.shipping_phone, o.shipping_city, o.shipping_state,
+            o.companyID, o.branchID, b.name AS branch_name, b.code AS branch_code,
+            NULL AS invoice_no, NULL AS cashier_id, NULL AS cashier_name,
+            (SELECT COUNT(*) FROM tblOrderItem oi WHERE oi.orderID = o.orderID) AS item_count,
+            (SELECT COALESCE(SUM(oi.quantity), 0) FROM tblOrderItem oi WHERE oi.orderID = o.orderID) AS item_qty,
+            o.created_at
+          FROM tblOrder o
+          LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
+          WHERE ${where}
+          ORDER BY o.created_at DESC
+          LIMIT 1000
+        `,
+          params
+        );
+        return [fallback];
+      });
       rows = list;
       columns = [
-        { key: 'order_number', label: 'Order' },
+        { key: 'invoice_no', label: 'Invoice Number' },
+        { key: 'order_number', label: 'Order ID' },
+        { key: 'created_at', label: 'Date & Time' },
+        { key: 'shipping_name', label: 'Customer Name' },
+        { key: 'shipping_phone', label: 'Customer Phone' },
+        { key: 'cashier_name', label: 'Cashier / Staff' },
         { key: 'branch_name', label: 'Branch' },
-        { key: 'order_source', label: 'Source' },
-        { key: 'shipping_name', label: 'Customer' },
-        { key: 'shipping_phone', label: 'Phone' },
-        { key: 'shipping_city', label: 'City' },
-        { key: 'item_count', label: 'Lines' },
-        { key: 'item_qty', label: 'Qty' },
-        { key: 'status', label: 'Status' },
-        { key: 'fulfillment_status', label: 'Fulfillment' },
-        { key: 'payment_method', label: 'Pay method' },
-        { key: 'payment_status', label: 'Payment' },
+        { key: 'item_qty', label: 'Total Items' },
         { key: 'subtotal', label: 'Subtotal' },
-        { key: 'discount', label: 'Discount' },
-        { key: 'tax_amount', label: 'Tax' },
-        { key: 'shipping_fee', label: 'Shipping' },
-        { key: 'round_off', label: 'Round off' },
-        { key: 'total', label: 'Total' },
-        { key: 'amount_received', label: 'Received' },
-        { key: 'created_at', label: 'Date' },
+        { key: 'total_discount', label: 'Discount' },
+        { key: 'tax_amount', label: 'GST / Tax' },
+        { key: 'total', label: 'Grand Total' },
+        { key: 'payment_method', label: 'Payment Method' },
+        { key: 'payment_status', label: 'Payment Status' },
+        { key: 'status', label: 'Order Status' },
+        { key: 'fulfillment_status', label: 'Fulfillment' },
+        { key: 'order_source', label: 'Source' },
+        { key: 'refund_amount', label: 'Refund' },
       ];
-      const revenue = rows.reduce((s, r) => s + Number(r.total || 0), 0);
-      const byStatus: Record<string, number> = {};
-      rows.forEach((r) => {
-        const k = r.status || 'unknown';
-        byStatus[k] = (byStatus[k] || 0) + 1;
-      });
+
+      const RETURN_STATUSES = new Set([
+        'returned',
+        'refunded',
+        'refund_pending',
+        'return_requested',
+      ]);
+      const isRefundedRow = (r: any) =>
+        RETURN_STATUSES.has(String(r.status || '').toLowerCase()) ||
+        Number(r.refund_completed) === 1 ||
+        String(r.refund_status || '').toLowerCase() === 'completed' ||
+        Number(r.refund_amount || 0) > 0;
+
+      // Gross / discount from all non-cancelled filtered rows (no double-count of refunds here)
+      const grossSales = rows.reduce((s, r) => s + Number(r.subtotal || 0), 0);
+      const totalDiscounts = rows.reduce(
+        (s, r) => s + Number(r.discount || 0) + Number(r.coupon_discount || 0),
+        0
+      );
+      // Refund amount only from refunded/returned rows — use stored refund_amount, else grand total once
+      const refundAmount = rows.reduce((s, r) => {
+        if (!isRefundedRow(r)) return s;
+        const stored = Number(r.refund_amount || 0);
+        return s + (stored > 0 ? stored : Number(r.total || 0));
+      }, 0);
+      // Net revenue excludes returned/refunded sales; refunds tracked separately
+      const netRows = rows.filter((r) => !RETURN_STATUSES.has(String(r.status || '').toLowerCase()));
+      const netRevenue = netRows.reduce((s, r) => s + Number(r.total || 0), 0);
+      const avgOrderValue = netRows.length ? netRevenue / netRows.length : 0;
+
       summary = {
         orders: rows.length,
-        revenue,
-        avg_ticket: rows.length ? revenue / rows.length : 0,
-        paid: rows.filter((r) => r.payment_status === 'paid').length,
+        gross_sales: grossSales,
+        net_revenue: netRevenue,
+        avg_order_value: avgOrderValue,
+        total_discounts: totalDiscounts,
+        refund_amount: refundAmount,
+        // legacy aliases for older UI keys
+        revenue: netRevenue,
+        avg_ticket: avgOrderValue,
+        paid: rows.filter((r) => String(r.payment_status).toLowerCase() === 'paid').length,
       };
-      chart = Object.entries(byStatus).map(([name, value]) => ({ name, value }));
+
+      // Trend: daily if range ≤ 45 days or day report; else monthly
+      const spanDays = (() => {
+        if (type === 'day') return 1;
+        if (dateFrom && dateTo) {
+          const a = new Date(dateFrom);
+          const b = new Date(dateTo);
+          return Math.max(1, Math.round((b.getTime() - a.getTime()) / 86400000) + 1);
+        }
+        return rows.length ? 30 : 30;
+      })();
+      const useDaily = type === 'day' || spanDays <= 45;
+      const trendMap: Record<string, number> = {};
+      netRows.forEach((r) => {
+        const dt = new Date(r.created_at);
+        if (Number.isNaN(dt.getTime())) return;
+        const key = useDaily
+          ? dt.toISOString().slice(0, 10)
+          : `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}`;
+        trendMap[key] = (trendMap[key] || 0) + Number(r.total || 0);
+      });
+      const salesTrend = Object.entries(trendMap)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, value]) => ({ name, value }));
+
+      const payMap: Record<string, number> = {};
+      netRows.forEach((r) => {
+        const k = String(r.payment_method || 'unknown').toUpperCase();
+        payMap[k] = (payMap[k] || 0) + Number(r.total || 0);
+      });
+      const paymentBreakdown = Object.entries(payMap)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, value]) => ({ name, value }));
+
+      // Top products under same filter scope
+      let topProducts: any[] = [];
+      try {
+        const [prodRows] = await db.query(
+          `
+          SELECT oi.product_name AS name,
+                 SUM(oi.quantity) AS qty,
+                 SUM(oi.quantity * oi.price) AS amount
+          FROM tblOrderItem oi
+          JOIN tblOrder o ON o.orderID = oi.orderID
+          LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
+          WHERE ${where}
+            AND o.status NOT IN ('returned','refunded','refund_pending','return_requested')
+          GROUP BY oi.product_name
+          ORDER BY qty DESC
+          LIMIT 10
+        `,
+          params
+        );
+        topProducts = (prodRows || []).map((r: any) => ({
+          name: r.name,
+          value: Number(r.qty || 0),
+          amount: Number(r.amount || 0),
+        }));
+      } catch (err: any) {
+        console.warn('sales top products:', err.message);
+      }
+
+      chart = salesTrend;
+      (summary as any)._charts = {
+        sales_trend: salesTrend,
+        sales_trend_grain: useDaily ? 'daily' : 'monthly',
+        payment_methods: paymentBreakdown,
+        top_products: topProducts,
+      };
+
+      // Filter option lists (scoped to company / branch)
+      try {
+        const foParams: any = { companyID };
+        let branchScope = '';
+        if (userBranch) {
+          branchScope = ' AND branchID = :foBranch';
+          foParams.foBranch = userBranch;
+        }
+        const [branchOpts] = await db.query(
+          `SELECT branchID AS id, name, code FROM tblBranch
+           WHERE companyID = :companyID AND is_active = 1
+           ORDER BY name ASC LIMIT 200`,
+          { companyID }
+        ).catch(() => [[]]);
+        const [cashierOpts] = await db.query(
+          `
+          SELECT u.userID AS id, u.name FROM (
+            SELECT DISTINCT pp.receivedByUserID AS uid
+            FROM tblPosPayment pp
+            JOIN tblOrder o ON o.orderID = pp.orderID
+            WHERE o.companyID = :companyID AND pp.receivedByUserID IS NOT NULL ${branchScope.replace('branchID', 'o.branchID')}
+            UNION
+            SELECT DISTINCT h.createdByUserID AS uid
+            FROM tblOrderStatusHistory h
+            JOIN tblOrder o ON o.orderID = h.orderID
+            WHERE o.companyID = :companyID AND h.createdByUserID IS NOT NULL ${branchScope.replace('branchID', 'o.branchID')}
+          ) x
+          JOIN tblUser u ON u.userID = x.uid
+          ORDER BY u.name ASC
+          LIMIT 200
+        `,
+          foParams
+        ).catch(() => [[]]);
+        (summary as any)._filter_options = {
+          branches: branchOpts || [],
+          cashiers: cashierOpts || [],
+          payment_methods: ['cash', 'upi', 'card', 'credit', 'online', 'cod', 'split'],
+          payment_statuses: ['pending', 'paid', 'failed', 'refund_pending', 'refunded'],
+          order_sources: ['pos', 'online', 'admin'],
+        };
+      } catch {
+        (summary as any)._filter_options = {
+          branches: [],
+          cashiers: [],
+          payment_methods: ['cash', 'upi', 'card', 'credit', 'online', 'cod', 'split'],
+          payment_statuses: ['pending', 'paid', 'failed', 'refund_pending', 'refunded'],
+          order_sources: ['pos', 'online', 'admin'],
+        };
+      }
     } else if (type === 'product') {
       const d = dateClause('o');
       const params: any = { ...d.params, companyID };
@@ -2186,7 +2591,7 @@ export const reports = async (req, res) => {
         byCity[k] = (byCity[k] || 0) + 1;
       });
       chart = Object.entries(byCity).map(([name, value]) => ({ name, value }));
-    } else if (type === 'billing') {
+    } else if (type === 'billing' || type === 'invoice' || type === 'bill') {
       const d = dateClause();
       const params: any = { ...d.params, companyID };
       let where = 'companyID = :companyID' + d.sql;
@@ -2232,7 +2637,259 @@ export const reports = async (req, res) => {
         byStatus[k] = (byStatus[k] || 0) + Number(r.total || 0);
       });
       chart = Object.entries(byStatus).map(([name, value]) => ({ name, value }));
-    } else if (type === 'auditing') {
+    } else if (type === 'refund') {
+      await ensureOrderBranchColumn();
+      const d = dateClause('o');
+      const params: any = { ...d.params, companyID };
+      let where = `o.companyID = :companyID AND (
+        o.status IN ('returned','refunded','refund_pending','return_requested')
+        OR o.refund_completed = 1
+        OR o.refund_status = 'completed'
+        OR COALESCE(o.refund_amount, 0) > 0
+      )${d.sql}`;
+      if (q) {
+        where += ` AND (
+          o.order_number LIKE :q OR o.shipping_name LIKE :q OR o.shipping_phone LIKE :q
+          OR EXISTS (SELECT 1 FROM tblBilling inv WHERE inv.orderID = o.orderID AND inv.invoice_no LIKE :q)
+        )`;
+        params.q = `%${q}%`;
+      }
+      const userBranch = getBranchId(req.user);
+      if (userBranch) {
+        where += ` AND o.branchID = :branchID`;
+        params.branchID = userBranch;
+      }
+      const [list] = await db.query(
+        `
+        SELECT
+          o.orderID AS id, o.order_number, o.status, o.payment_status, o.fulfillment_status,
+          o.total, o.refund_amount, o.refund_status, o.refund_method, o.shipping_name, o.shipping_phone,
+          o.created_at, b.name AS branch_name,
+          (SELECT inv.invoice_no FROM tblBilling inv WHERE inv.orderID = o.orderID ORDER BY inv.billingID DESC LIMIT 1) AS invoice_no
+        FROM tblOrder o
+        LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
+        WHERE ${where}
+        ORDER BY o.created_at DESC
+        LIMIT 1000
+      `,
+        params
+      ).catch(() => [[]]);
+      rows = list;
+      columns = [
+        { key: 'invoice_no', label: 'Invoice' },
+        { key: 'order_number', label: 'Order ID' },
+        { key: 'shipping_name', label: 'Customer' },
+        { key: 'branch_name', label: 'Branch' },
+        { key: 'status', label: 'Order Status' },
+        { key: 'payment_status', label: 'Payment Status' },
+        { key: 'total', label: 'Order Total' },
+        { key: 'refund_amount', label: 'Refund Amount' },
+        { key: 'refund_status', label: 'Refund Status' },
+        { key: 'created_at', label: 'Date' },
+      ];
+      const refundTotal = rows.reduce((s, r) => s + Number(r.refund_amount || r.total || 0), 0);
+      summary = {
+        orders: rows.length,
+        refund_amount: refundTotal,
+        net_revenue: 0,
+        gross_sales: rows.reduce((s, r) => s + Number(r.total || 0), 0),
+      };
+      chart = rows.slice(0, 12).map((r) => ({
+        name: r.order_number || String(r.id),
+        value: Number(r.refund_amount || r.total || 0),
+      }));
+    } else if (type === 'month') {
+      await ensureOrderBranchColumn();
+      const d = dateClause('o');
+      const params: any = { ...d.params, companyID };
+      let where = `o.status <> 'cancelled' AND o.companyID = :companyID${d.sql}`;
+      const userBranch = getBranchId(req.user);
+      if (userBranch) {
+        where += ` AND o.branchID = :branchID`;
+        params.branchID = userBranch;
+      }
+      const [list] = await db.query(
+        `
+        SELECT
+          DATE_FORMAT(o.created_at, '%Y-%m') AS period,
+          COUNT(*) AS orders,
+          SUM(o.subtotal) AS gross_sales,
+          SUM(CASE
+            WHEN o.status IN ('returned','refunded','refund_pending','return_requested') THEN 0
+            ELSE o.total
+          END) AS net_revenue,
+          SUM(COALESCE(o.discount,0) + COALESCE(o.coupon_discount,0)) AS total_discounts,
+          SUM(CASE
+            WHEN o.status IN ('returned','refunded','refund_pending','return_requested')
+              OR o.refund_completed = 1 OR COALESCE(o.refund_amount,0) > 0
+            THEN COALESCE(NULLIF(o.refund_amount, 0), o.total)
+            ELSE 0
+          END) AS refund_amount
+        FROM tblOrder o
+        WHERE ${where}
+        GROUP BY DATE_FORMAT(o.created_at, '%Y-%m')
+        ORDER BY period DESC
+        LIMIT 36
+      `,
+        params
+      ).catch(() => [[]]);
+      rows = list;
+      columns = [
+        { key: 'period', label: 'Month' },
+        { key: 'orders', label: 'Orders' },
+        { key: 'gross_sales', label: 'Gross Sales' },
+        { key: 'net_revenue', label: 'Net Revenue' },
+        { key: 'total_discounts', label: 'Discounts' },
+        { key: 'refund_amount', label: 'Refunds' },
+      ];
+      summary = {
+        orders: rows.reduce((s, r) => s + Number(r.orders || 0), 0),
+        gross_sales: rows.reduce((s, r) => s + Number(r.gross_sales || 0), 0),
+        net_revenue: rows.reduce((s, r) => s + Number(r.net_revenue || 0), 0),
+        refund_amount: rows.reduce((s, r) => s + Number(r.refund_amount || 0), 0),
+      };
+      chart = [...rows].reverse().map((r) => ({ name: r.period, value: Number(r.net_revenue || 0) }));
+      (summary as any)._charts = {
+        sales_trend: chart,
+        sales_trend_grain: 'monthly',
+        payment_methods: [],
+        top_products: [],
+      };
+    } else if (type === 'upi') {
+      await ensureOrderBranchColumn();
+      const d = dateClause('o');
+      const params: any = { ...d.params, companyID };
+      let where = `o.companyID = :companyID AND (
+        LOWER(pp.method) = 'upi' OR LOWER(o.payment_method) = 'upi'
+      )${d.sql}`;
+      if (q) {
+        where += ` AND (o.order_number LIKE :q OR pp.reference_no LIKE :q OR o.shipping_name LIKE :q)`;
+        params.q = `%${q}%`;
+      }
+      const userBranch = getBranchId(req.user);
+      if (userBranch) {
+        where += ` AND o.branchID = :branchID`;
+        params.branchID = userBranch;
+      }
+      const [list] = await db.query(
+        `
+        SELECT
+          pp.posPaymentID AS id,
+          o.order_number,
+          o.shipping_name,
+          o.shipping_phone,
+          pp.amount,
+          pp.reference_no,
+          pp.status,
+          pp.paid_at,
+          pp.created_at,
+          b.name AS branch_name,
+          u.name AS cashier_name,
+          (SELECT inv.invoice_no FROM tblBilling inv WHERE inv.orderID = o.orderID ORDER BY inv.billingID DESC LIMIT 1) AS invoice_no
+        FROM tblPosPayment pp
+        JOIN tblOrder o ON o.orderID = pp.orderID
+        LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
+        LEFT JOIN tblUser u ON u.userID = pp.receivedByUserID
+        WHERE ${where}
+        ORDER BY COALESCE(pp.paid_at, pp.created_at) DESC
+        LIMIT 1000
+      `,
+        params
+      ).catch(async () => {
+        const [fallback] = await db.query(
+          `
+          SELECT
+            o.orderID AS id, o.order_number, o.shipping_name, o.shipping_phone,
+            o.total AS amount, NULL AS reference_no, o.payment_status AS status,
+            o.created_at AS paid_at, o.created_at, b.name AS branch_name,
+            NULL AS cashier_name, NULL AS invoice_no
+          FROM tblOrder o
+          LEFT JOIN tblBranch b ON b.branchID = o.branchID AND b.companyID = o.companyID
+          WHERE o.companyID = :companyID AND LOWER(o.payment_method) = 'upi' AND o.status <> 'cancelled'
+          ORDER BY o.created_at DESC LIMIT 1000
+        `,
+          { companyID }
+        ).catch(() => [[]]);
+        return [fallback];
+      });
+      rows = list;
+      columns = [
+        { key: 'invoice_no', label: 'Invoice' },
+        { key: 'order_number', label: 'Order ID' },
+        { key: 'shipping_name', label: 'Customer' },
+        { key: 'amount', label: 'Amount' },
+        { key: 'reference_no', label: 'UPI Ref' },
+        { key: 'status', label: 'Status' },
+        { key: 'cashier_name', label: 'Cashier' },
+        { key: 'branch_name', label: 'Branch' },
+        { key: 'paid_at', label: 'Paid At' },
+      ];
+      const amount = rows.reduce((s, r) => s + Number(r.amount || 0), 0);
+      summary = { orders: rows.length, net_revenue: amount, gross_sales: amount, paid: rows.filter((r) => String(r.status).toLowerCase() === 'paid').length };
+      chart = Object.entries(
+        rows.reduce((acc: Record<string, number>, r) => {
+          const k = String(r.status || 'unknown');
+          acc[k] = (acc[k] || 0) + Number(r.amount || 0);
+          return acc;
+        }, {})
+      ).map(([name, value]) => ({ name, value }));
+    } else if (type === 'barcode') {
+      const params: any = { companyID };
+      let where = 'p.companyID = :companyID';
+      if (q) {
+        where += ` AND (p.name LIKE :q OR pv.stock_code LIKE :q OR pv.barcode LIKE :q OR pv.sku LIKE :q)`;
+        params.q = `%${q}%`;
+      }
+      const [list] = await db.query(
+        `
+        SELECT
+          p.name AS product_name,
+          COALESCE(pv.stock_code, pv.sku, p.sku) AS sku,
+          pv.barcode,
+          pv.size,
+          pv.color,
+          COALESCE(i.available_qty, pv.stock, 0) AS available_qty,
+          w.name AS warehouse
+        FROM tblProductVariant pv
+        JOIN tblProduct p ON p.productID = pv.productID
+        LEFT JOIN tblInventory i ON i.productVariantID = pv.productVariantID
+        LEFT JOIN tblWarehouse w ON w.warehouseID = i.warehouseID
+        WHERE ${where}
+          AND pv.barcode IS NOT NULL AND TRIM(pv.barcode) <> ''
+        ORDER BY p.name ASC, pv.barcode ASC
+        LIMIT 1000
+      `,
+        params
+      ).catch(async () => {
+        const [fallback] = await db.query(
+          `
+          SELECT p.name AS product_name, p.sku, p.barcode, NULL AS size, NULL AS color,
+                 p.stock AS available_qty, p.warehouse AS warehouse
+          FROM tblProduct p
+          WHERE p.companyID = :companyID AND p.barcode IS NOT NULL AND TRIM(p.barcode) <> ''
+          ORDER BY p.name ASC LIMIT 1000
+        `,
+          { companyID }
+        ).catch(() => [[]]);
+        return [fallback];
+      });
+      rows = list;
+      columns = [
+        { key: 'product_name', label: 'Product' },
+        { key: 'sku', label: 'SKU' },
+        { key: 'barcode', label: 'Barcode' },
+        { key: 'size', label: 'Size' },
+        { key: 'color', label: 'Colour' },
+        { key: 'available_qty', label: 'Qty' },
+        { key: 'warehouse', label: 'Warehouse' },
+      ];
+      summary = {
+        products: new Set(rows.map((r) => r.product_name).filter(Boolean)).size,
+        skus: rows.length,
+        available: rows.reduce((s, r) => s + Number(r.available_qty || 0), 0),
+      };
+      chart = rows.slice(0, 10).map((r) => ({ name: r.barcode || r.sku, value: Number(r.available_qty || 0) }));
+    } else if (type === 'auditing' || type === 'auditlog') {
       await ensureOrderBranchColumn();
       const d = dateClause('h');
       const params: any = { ...d.params, companyID };
@@ -2306,13 +2963,36 @@ export const reports = async (req, res) => {
       return fail(res, 'Unknown report type', 400);
     }
 
+    const charts = (summary as any)?._charts || null;
+    const filter_options = (summary as any)?._filter_options || null;
+    if (summary && typeof summary === 'object') {
+      delete (summary as any)._charts;
+      delete (summary as any)._filter_options;
+    }
+
     return ok(res, {
       type,
-      filters: { date_from: dateFrom, date_to: dateTo, q, status, source, payment_status: paymentStatus, warehouse, active, city },
+      filters: {
+        date_from: dateFrom,
+        date_to: dateTo,
+        q,
+        status,
+        source,
+        payment_status: paymentStatus,
+        payment_method: String(req.query.payment_method || '').trim(),
+        cashier: String(req.query.cashier_id || req.query.cashier || '').trim(),
+        customer: String(req.query.customer || '').trim(),
+        warehouse,
+        active,
+        city,
+        branch: String(req.query.branch || req.query.branch_id || '').trim(),
+      },
       columns,
       rows,
       summary,
       chart,
+      charts,
+      filter_options,
     });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);

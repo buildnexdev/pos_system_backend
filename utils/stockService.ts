@@ -26,15 +26,25 @@ async function getExecutor(connection) {
   return connection || db;
 }
 
+/** Normalize tbl* rows so callers can use `.id` after PK rename (productID / warehouseID / …). */
+function withId(row, ...keys) {
+  if (!row) return null;
+  if (row.id != null) return row;
+  for (const key of keys) {
+    if (row[key] != null) return { ...row, id: row[key] };
+  }
+  return row;
+}
+
 async function getDefaultWarehouse(executor) {
   const [rows] = await executor.query(
-    `SELECT * FROM tblWarehouse WHERE is_active = 1 ORDER BY is_default DESC, id ASC LIMIT 1`
+    `SELECT * FROM tblWarehouse WHERE is_active = 1 ORDER BY is_default DESC, warehouseID ASC LIMIT 1`
   );
-  if (rows.length) return rows[0];
+  if (rows.length) return withId(rows[0], 'warehouseID');
   const [ins] = await executor.query(
     `INSERT INTO tblWarehouse (name, code, is_default, is_active) VALUES ('Main Warehouse', 'MAIN', 1, 1)`
   );
-  return { id: ins.insertId, name: 'Main Warehouse', code: 'MAIN', is_default: 1 };
+  return { id: ins.insertId, warehouseID: ins.insertId, name: 'Main Warehouse', code: 'MAIN', is_default: 1 };
 }
 
 async function findVariant(executor, productId, { variantId, size, color }: any = {}) {
@@ -45,7 +55,7 @@ async function findVariant(executor, productId, { variantId, size, color }: any 
         : 'SELECT * FROM tblProductVariant WHERE productVariantID = :id LIMIT 1',
       productId ? { id: variantId, productId } : { id: variantId }
     );
-    return rows[0] || null;
+    return withId(rows[0], 'productVariantID');
   }
   if (productId && size && color) {
     const [rows] = await executor.query(
@@ -54,7 +64,7 @@ async function findVariant(executor, productId, { variantId, size, color }: any 
        LIMIT 1`,
       { productId, size, color }
     );
-    return rows[0] || null;
+    return withId(rows[0], 'productVariantID');
   }
   return null;
 }
@@ -64,7 +74,7 @@ async function ensureInventoryRow(executor, { productId, variantId, warehouseId,
     `SELECT * FROM tblInventory WHERE productVariantID = :variantId AND warehouseID = :warehouseId LIMIT 1`,
     { variantId, warehouseId }
   );
-  if (rows.length) return rows[0];
+  if (rows.length) return withId(rows[0], 'inventoryID');
 
   const status = computeStockStatus(0, minStock);
   const [ins] = await executor.query(
@@ -74,7 +84,7 @@ async function ensureInventoryRow(executor, { productId, variantId, warehouseId,
     { productId, variantId, warehouseId, minStock, status }
   );
   const [created] = await executor.query(`SELECT * FROM tblInventory WHERE inventoryID = :id`, { id: ins.insertId });
-  return created[0];
+  return withId(created[0], 'inventoryID');
 }
 
 async function ensureInventoryForVariant(executor, variant, warehouseId = null) {
@@ -119,7 +129,8 @@ async function syncProductStock(executor, productId) {
 
 async function getProductStockMeta(executor, productId) {
   const [rows] = await executor.query(
-    'SELECT id, stock, min_stock, warehouse, stock_status FROM tblProduct WHERE productID = :id LIMIT 1',
+    `SELECT productID AS id, productID, stock, min_stock, warehouse, stock_status
+     FROM tblProduct WHERE productID = :id LIMIT 1`,
     { id: productId }
   );
   return rows[0] || null;
@@ -189,13 +200,13 @@ async function applyStockChange(options: any = {}, connection: any = null) {
   let warehouseRow = defaultWh;
   if (warehouseId) {
     const [rows] = await executor.query(`SELECT * FROM tblWarehouse WHERE warehouseID = :id`, { id: warehouseId });
-    if (rows.length) warehouseRow = rows[0];
+    if (rows.length) warehouseRow = withId(rows[0], 'warehouseID');
   } else if (warehouse) {
     const [rows] = await executor.query(
       `SELECT * FROM tblWarehouse WHERE code = :code OR name = :code LIMIT 1`,
       { code: String(warehouse).trim() }
     );
-    if (rows.length) warehouseRow = rows[0];
+    if (rows.length) warehouseRow = withId(rows[0], 'warehouseID');
   }
 
   let qtyBefore = 0;
@@ -664,13 +675,17 @@ async function listStockItems(filters: any = {}) {
 
   const [rows] = await db.query(
     `SELECT
-        i.id AS inventory_id,
+        i.inventoryID AS inventory_id,
+        i.inventoryID AS id,
         i.available_qty, i.opening_stock, i.purchased_qty, i.sold_qty, i.damaged_qty,
         i.returned_qty, i.reserved_qty, i.min_stock, i.status AS stock_status,
+        i.warehouseID AS warehouse_id,
         i.warehouseID,
         w.name AS warehouse_name, w.code AS warehouse_code,
+        pv.productVariantID AS variant_id,
         pv.productVariantID AS productVariantID, pv.size, pv.color, pv.stock_code, pv.barcode, pv.image_url AS variant_image,
         pv.is_active AS variant_active, pv.price AS variant_price,
+        p.productID AS product_id,
         p.productID AS productID, p.name AS product_name, p.sku AS product_code, p.brand, p.price AS mrp,
         p.sale_price, p.is_active AS product_active,
         c.name AS category_name, pt.name AS product_type_name,
@@ -686,6 +701,34 @@ async function listStockItems(filters: any = {}) {
     params
   );
   return rows;
+}
+
+async function stockStatusSummary(companyID?: number) {
+  const params: any[] = [];
+  let companySql = '';
+  if (companyID) {
+    companySql = ' AND i.companyID = ? AND p.companyID = ?';
+    params.push(companyID, companyID);
+  }
+  const [[row]] = await db.query(
+    `SELECT
+        COUNT(*) AS current_total,
+        COALESCE(SUM(CASE WHEN i.status = 'low_stock' THEN 1 ELSE 0 END), 0) AS low_total,
+        COALESCE(SUM(CASE WHEN i.status = 'out_of_stock' THEN 1 ELSE 0 END), 0) AS out_total,
+        COALESCE(SUM(CASE WHEN i.damaged_qty > 0 OR i.status = 'damaged' THEN 1 ELSE 0 END), 0) AS damaged_total,
+        COALESCE(SUM(i.available_qty), 0) AS available_units
+     FROM tblInventory i
+     JOIN tblProduct p ON p.productID = i.productID
+     WHERE 1=1 ${companySql}`,
+    params
+  );
+  return {
+    current: Number(row?.current_total || 0),
+    low: Number(row?.low_total || 0),
+    out: Number(row?.out_total || 0),
+    damaged: Number(row?.damaged_total || 0),
+    available_units: Number(row?.available_units || 0),
+  };
 }
 
 async function listStockHistory(filters: any = {}) {
@@ -733,7 +776,7 @@ async function listStockHistory(filters: any = {}) {
      LEFT JOIN tblWarehouse w ON w.warehouseID = sm.warehouseID
      LEFT JOIN tblUser u ON u.userID = sm.createdByUserID
      WHERE ${where}
-     ORDER BY COALESCE(sm.movement_date, sm.created_at) DESC, sm.id DESC
+     ORDER BY COALESCE(sm.movement_date, sm.created_at) DESC, sm.stockMovementID DESC
      LIMIT ${safeLimit}`,
     params
   );
@@ -842,4 +885,4 @@ async function listWarehouses(companyID?: number) {
   return rows;
 }
 
-export { computeStockStatus, findVariant, syncProductStock, refreshStockStatus, applyStockChange, reserveStock, releaseReservedStock, finalizeReservedSale, restockReturnedSellable, listStockHistory, listLowStock, listStockItems, stockReport, listWarehouses, getDefaultWarehouse, ensureInventoryForVariant, ensureInventoryRow };
+export { computeStockStatus, findVariant, syncProductStock, refreshStockStatus, applyStockChange, reserveStock, releaseReservedStock, finalizeReservedSale, restockReturnedSellable, listStockHistory, listLowStock, listStockItems, stockStatusSummary, stockReport, listWarehouses, getDefaultWarehouse, ensureInventoryForVariant, ensureInventoryRow };

@@ -11,7 +11,8 @@ import { requireAuth,
   requireAdmin,
   requirePanelUser,
   optionalAuth,
-  requireRight
+  requireRight,
+  requireAnyRight,
  } from '../middleware/auth';
 
 import * as auth from '../controllers/authController';
@@ -97,8 +98,18 @@ router.get('/panel/rights/:userId', requireAuth, requireRight('access_control', 
 router.put('/panel/rights/:userId', requireAuth, requireRight('access_control', 'edit'), panel.saveRights);
 
 // Product types
-router.get('/panel/product-types', requireAuth, requireRight('product_type', 'view'), panel.listProductTypes);
-router.post('/panel/product-types', requireAuth, requireRight('product_type', 'create'), panel.saveProductType);
+router.get(
+  '/panel/product-types',
+  requireAuth,
+  requireAnyRight(['product_type', 'catalog', 'product'], 'view'),
+  panel.listProductTypes
+);
+router.post(
+  '/panel/product-types',
+  requireAuth,
+  requireAnyRight(['product_type', 'catalog'], 'create'),
+  panel.saveProductType
+);
 router.put('/panel/product-types/:id', requireAuth, requireRight('product_type', 'edit'), panel.saveProductType);
 router.delete('/panel/product-types/:id', requireAuth, requireRight('product_type', 'delete'), panel.deleteProductType);
 
@@ -134,11 +145,11 @@ router.delete('/panel/suppliers/:id', requireAuth, requireRight('supplier', 'del
 
 // Products / Orders (reuse admin controller with rights)
 router.get('/panel/dashboard', requireAuth, requireRight('dashboard', 'view'), admin.dashboard);
-router.get('/panel/products', requireAuth, requireRight('product', 'view'), admin.products);
-router.get('/panel/products/:id', requireAuth, requireRight('product', 'view'), admin.getProduct);
-router.post('/panel/products', requireAuth, requireRight('product', 'create'), admin.saveProduct);
-router.put('/panel/products/:id', requireAuth, requireRight('product', 'edit'), admin.saveProduct);
-router.delete('/panel/products/:id', requireAuth, requireRight('product', 'delete'), admin.deleteProduct);
+router.get('/panel/products', requireAuth, requireRight('catalog', 'view'), admin.products);
+router.get('/panel/products/:id', requireAuth, requireRight('catalog', 'view'), admin.getProduct);
+router.post('/panel/products', requireAuth, requireRight('catalog', 'create'), admin.saveProduct);
+router.put('/panel/products/:id', requireAuth, requireRight('catalog', 'edit'), admin.saveProduct);
+router.delete('/panel/products/:id', requireAuth, requireRight('catalog', 'delete'), admin.deleteProduct);
 router.get('/panel/stock/items', requireAuth, requireRight('product', 'view'), admin.stockItems);
 router.post('/panel/stock/move', requireAuth, requireRight('product', 'edit'), admin.stockMove);
 router.get('/panel/stock/history', requireAuth, requireRight('product', 'view'), admin.stockHistory);
@@ -159,7 +170,7 @@ router.delete('/panel/warehouses/:id', requireAuth, requireRight('warehouse', 'd
 router.post(
   '/panel/upload/product-image',
   requireAuth,
-  requirePanelUser,
+  requireAnyRight(['catalog'], 'view'),
   upload.single('image'),
   async (req, res) => {
     try {
@@ -241,12 +252,130 @@ router.post(
     }
   }
 );
-router.get('/panel/categories', requireAuth, requireRight('product', 'view'), admin.categories);
-router.get('/panel/orders', requireAuth, requireRight('order', 'view'), admin.orders);
-router.get('/panel/orders/:id', requireAuth, requireRight('order', 'view'), admin.orderDetail);
+router.post(
+  '/panel/upload/staff-document',
+  requireAuth,
+  requirePanelUser,
+  companyUpload.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: 'No file uploaded' });
+      }
+      const filename = makeFilename('staff-doc', req.file.originalname);
+      const stored = await storeUpload(req.file, 'staff', filename);
+      return res.json({
+        success: true,
+        data: {
+          url: stored.url,
+          filename: stored.filename,
+          original_name: req.file.originalname,
+          mime_type: req.file.mimetype,
+          size: req.file.size,
+          storage: stored.storage,
+        },
+        message: 'Document uploaded',
+      });
+    } catch (err: any) {
+      console.error('staff-document upload:', err);
+      return res.status(500).json({
+        success: false,
+        message: err?.message || 'Document upload failed',
+      });
+    }
+  }
+);
+router.get(
+  '/panel/categories',
+  requireAuth,
+  requireAnyRight(['category', 'catalog', 'product', 'product_type'], 'view'),
+  admin.categories
+);
+router.post(
+  '/panel/categories',
+  requireAuth,
+  requireAnyRight(['category', 'catalog'], 'create'),
+  admin.saveCategory
+);
+router.put('/panel/categories/:id', requireAuth, requireRight('category', 'edit'), admin.saveCategory);
+router.delete('/panel/categories/:id', requireAuth, requireRight('category', 'delete'), admin.deleteCategory);
+
+router.get(
+  '/panel/brands',
+  requireAuth,
+  requireAnyRight(['brand', 'catalog', 'product'], 'view'),
+  admin.brands
+);
+router.post(
+  '/panel/brands',
+  requireAuth,
+  requireAnyRight(['brand', 'catalog'], 'create'),
+  admin.saveBrand
+);
+router.put('/panel/brands/:id', requireAuth, requireRight('brand', 'edit'), admin.saveBrand);
+router.delete('/panel/brands/:id', requireAuth, requireRight('brand', 'delete'), admin.deleteBrand);
+
+router.get(
+  '/panel/material-types',
+  requireAuth,
+  requireAnyRight(['material_type', 'catalog', 'product'], 'view'),
+  admin.materialTypes
+);
+router.post(
+  '/panel/material-types',
+  requireAuth,
+  requireAnyRight(['material_type', 'catalog'], 'create'),
+  admin.saveMaterialType
+);
+router.put(
+  '/panel/material-types/:id',
+  requireAuth,
+  requireRight('material_type', 'edit'),
+  admin.saveMaterialType
+);
+router.delete(
+  '/panel/material-types/:id',
+  requireAuth,
+  requireRight('material_type', 'delete'),
+  admin.deleteMaterialType
+);
+router.get(
+  '/panel/orders',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'view'),
+  admin.orders
+);
+router.get(
+  '/panel/orders/track',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'view'),
+  admin.trackOrder
+);
+router.get(
+  '/panel/orders/:id',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'view'),
+  admin.orderDetail
+);
 router.post('/panel/orders', requireAuth, requireRight('order', 'create'), admin.createOrder);
-router.put('/panel/orders/:id', requireAuth, requireRight('order', 'edit'), admin.updateOrderStatus);
-router.post('/panel/orders/:id/cancel', requireAuth, requireRight('order', 'edit'), admin.cancelOrderPanel);
+router.put(
+  '/panel/orders/:id',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'edit'),
+  admin.updateOrderStatus
+);
+router.post(
+  '/panel/orders/:id/cancel',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'edit'),
+  admin.cancelOrderPanel
+);
+router.post(
+  '/panel/orders/:id/return',
+  requireAuth,
+  requireAnyRight(['order', 'order_tracking'], 'edit'),
+  admin.returnOrderPanel
+);
 router.post('/panel/orders/:id/archive', requireAuth, requireRight('order', 'edit'), admin.archiveOrder);
 router.delete('/panel/orders/:id', requireAuth, requireRight('order', 'delete'), admin.deleteOrder);
 router.get('/panel/customers', requireAuth, requireRight('customer', 'view'), admin.customers);
@@ -265,7 +394,18 @@ router.post('/panel/payment-gateways', requireAuth, requireRight('payment_gatewa
 router.put('/panel/payment-gateways/:id', requireAuth, requireRight('payment_gateway', 'edit'), panel.saveGateway);
 router.delete('/panel/payment-gateways/:id', requireAuth, requireRight('payment_gateway', 'delete'), panel.deleteGateway);
 
-router.get('/panel/billings', requireAuth, requireRight('billing', 'view'), panel.listBillings);
+router.get(
+  '/panel/billings',
+  requireAuth,
+  requireAnyRight(['billing', 'order_tracking', 'order'], 'view'),
+  panel.listBillings
+);
+router.get(
+  '/panel/billings/:id',
+  requireAuth,
+  requireAnyRight(['billing', 'order_tracking', 'order'], 'view'),
+  panel.getBilling
+);
 router.post('/panel/billings', requireAuth, requireRight('billing', 'create'), panel.saveBilling);
 router.put('/panel/billings/:id', requireAuth, requireRight('billing', 'edit'), panel.saveBilling);
 router.delete('/panel/billings/:id', requireAuth, requireRight('billing', 'delete'), panel.deleteBilling);

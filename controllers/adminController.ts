@@ -3,18 +3,19 @@
  * Version: 0.0.1
  * Desc: Admin dashboard, tblProduct, stock and tblOrder
  * Edit Date: 2026-11-14
- */
-
+*/
 import bcrypt from 'bcryptjs';
 import db from '../config/db';
 import { ok, fail, slugify, orderNumber  } from '../utils/helpers';
 import { USER_ROLE_JOIN, SQL_CUSTOMER_USER } from '../config/userRole';
 import { getRoleId } from '../utils/roleLookup';
 import { requireCompanyId, CompanyScopeError } from '../utils/companyScope';
+import { upcomingFestivals } from '../config/festivals';
 import { applyStockChange,
   listStockHistory,
   listLowStock,
   listStockItems,
+  stockStatusSummary,
   stockReport,
   listWarehouses as listWarehousesService,
   ensureInventoryForVariant,
@@ -50,10 +51,25 @@ export const dashboard = async (req, res) => {
           WHERE u.companyID = :companyID
             AND (r.RoleCode = 'customer' OR r.Level >= 90 OR u.roleID IS NULL)) AS customers,
         (SELECT COALESCE(SUM(total), 0) FROM tblOrder
-          WHERE companyID = :companyID AND status <> 'cancelled') AS revenue
+          WHERE companyID = :companyID AND status <> 'cancelled') AS revenue,
+        (SELECT COUNT(*) FROM tblOrder
+          WHERE companyID = :companyID AND status IN ('pending','confirmed','processing','packed')) AS open_orders,
+        (SELECT COALESCE(SUM(total), 0) FROM tblOrder
+          WHERE companyID = :companyID AND status <> 'cancelled'
+            AND DATE(created_at) = CURDATE()) AS today_revenue,
+        (SELECT COUNT(*) FROM tblOrder
+          WHERE companyID = :companyID AND DATE(created_at) = CURDATE()) AS today_orders,
+        (SELECT COUNT(*) FROM tblProductVariant pv
+          JOIN tblProduct p ON p.productID = pv.productID
+          WHERE p.companyID = :companyID) AS variants,
+        (SELECT COUNT(*) FROM tblInventory i
+          JOIN tblProduct p ON p.productID = i.productID
+          WHERE p.companyID = :companyID
+            AND i.status IN ('low_stock','out_of_stock','damaged')) AS low_stock
     `,
       { companyID }
     );
+
     const [recentOrders] = await db.query(
       `
       SELECT o.*, u.name AS customer_name
@@ -63,8 +79,239 @@ export const dashboard = async (req, res) => {
     `,
       { companyID }
     );
+
     const lowStock = await listLowStock({ limit: 8, companyID });
-    return ok(res, { stats, recentOrders, lowStock });
+
+    const [topStocks] = await db.query(
+      `
+      SELECT p.name, p.sku, pv.size, pv.color, i.available_qty, i.status,
+             w.name AS warehouse_name
+      FROM tblInventory i
+      JOIN tblProduct p ON p.productID = i.productID
+      JOIN tblProductVariant pv ON pv.productVariantID = i.productVariantID
+      JOIN tblWarehouse w ON w.warehouseID = i.warehouseID
+      WHERE p.companyID = :companyID
+        AND i.companyID = :companyID
+        AND p.is_active = 1
+        AND i.available_qty > 0
+      ORDER BY i.available_qty DESC
+      LIMIT 8
+    `,
+      { companyID }
+    );
+
+    const [birthdayRows] = await db.query(
+      `
+      SELECT u.userID AS id, u.name, sp.employee_code, sp.date_of_birth,
+             DATE_FORMAT(sp.date_of_birth, '%d %b') AS birthday_label
+      FROM tblStaffProfile sp
+      JOIN tblUser u ON u.userID = sp.userID
+      WHERE u.companyID = :companyID
+        AND COALESCE(u.is_active, 1) = 1
+        AND sp.date_of_birth IS NOT NULL
+    `,
+      { companyID }
+    );
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const birthdays = (birthdayRows || [])
+      .map((row: any) => {
+        const raw = row.date_of_birth;
+        const dob =
+          raw instanceof Date
+            ? raw
+            : new Date(String(raw).slice(0, 10) + 'T00:00:00');
+        if (Number.isNaN(dob.getTime())) return null;
+        const next = new Date(today.getFullYear(), dob.getMonth(), dob.getDate());
+        if (next < today) next.setFullYear(today.getFullYear() + 1);
+        const daysUntil = Math.round((next.getTime() - today.getTime()) / 86400000);
+        if (daysUntil > 30) return null;
+        return {
+          id: row.id,
+          name: row.name,
+          employee_code: row.employee_code || null,
+          date_of_birth: String(raw).slice(0, 10),
+          birthday_label: row.birthday_label || next.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }),
+          days_until: daysUntil,
+          is_today: daysUntil === 0,
+        };
+      })
+      .filter(Boolean)
+      .sort((a: any, b: any) => a.days_until - b.days_until)
+      .slice(0, 8);
+
+    const festivals = upcomingFestivals(45, 8);
+
+    const [ordersByStatus] = await db.query(
+      `
+      SELECT status AS name, COUNT(*) AS value
+      FROM tblOrder
+      WHERE companyID = :companyID
+      GROUP BY status
+      ORDER BY value DESC
+    `,
+      { companyID }
+    );
+
+    const localDayKey = (d: Date) => {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return `${y}-${m}-${day}`;
+    };
+
+    const parseSqlDate = (value: any) => {
+      if (value instanceof Date) return value;
+      const s = String(value || '').slice(0, 10);
+      const [y, m, d] = s.split('-').map(Number);
+      if (!y || !m || !d) return null;
+      return new Date(y, m - 1, d);
+    };
+
+    const startOfWeekMon = (d: Date) => {
+      const x = new Date(d);
+      x.setHours(0, 0, 0, 0);
+      const weekday = (x.getDay() + 6) % 7; // Mon=0 … Sun=6
+      x.setDate(x.getDate() - weekday);
+      return x;
+    };
+
+    const fmtShort = (d: Date) =>
+      d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+
+    const [revenueByDayRows] = await db.query(
+      `
+      SELECT DATE(created_at) AS day_key,
+             COUNT(*) AS orders,
+             COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN total ELSE 0 END), 0) AS revenue
+      FROM tblOrder
+      WHERE companyID = :companyID
+        AND created_at >= DATE_SUB(CURDATE(), INTERVAL 6 DAY)
+        AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+      GROUP BY DATE(created_at)
+      ORDER BY day_key ASC
+    `,
+      { companyID }
+    );
+
+    type RevAgg = { orders?: number; revenue?: number };
+    // Always return 7 points (fill missing days with 0)
+    const byDay = new Map<string, RevAgg>(
+      (revenueByDayRows || []).map((row: any) => {
+        const parsed = parseSqlDate(row.day_key);
+        const key = parsed ? localDayKey(parsed) : String(row.day_key).slice(0, 10);
+        return [key, row as RevAgg];
+      })
+    );
+    const revenueByDay = [];
+    for (let i = 6; i >= 0; i -= 1) {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      d.setDate(d.getDate() - i);
+      const key = localDayKey(d);
+      const row = byDay.get(key);
+      revenueByDay.push({
+        label: d.toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' }),
+        day: d.toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' }),
+        day_key: key,
+        orders: Number(row?.orders) || 0,
+        revenue: Number(row?.revenue) || 0,
+      });
+    }
+
+    // Last 8 Mon–Sun weeks (weekwise report)
+    const thisWeekStart = startOfWeekMon(new Date());
+    const weekRangeStart = new Date(thisWeekStart);
+    weekRangeStart.setDate(weekRangeStart.getDate() - 7 * 7);
+
+    const [revenueByWeekRows] = await db.query(
+      `
+      SELECT DATE_SUB(DATE(created_at), INTERVAL WEEKDAY(created_at) DAY) AS week_start,
+             COUNT(*) AS orders,
+             COALESCE(SUM(CASE WHEN status <> 'cancelled' THEN total ELSE 0 END), 0) AS revenue
+      FROM tblOrder
+      WHERE companyID = :companyID
+        AND created_at >= :weekFrom
+        AND created_at < DATE_ADD(CURDATE(), INTERVAL 1 DAY)
+      GROUP BY DATE_SUB(DATE(created_at), INTERVAL WEEKDAY(created_at) DAY)
+      ORDER BY week_start ASC
+    `,
+      { companyID, weekFrom: localDayKey(weekRangeStart) }
+    );
+
+    const byWeek = new Map<string, RevAgg>(
+      (revenueByWeekRows || []).map((row: any) => {
+        const parsed = parseSqlDate(row.week_start);
+        const key = parsed ? localDayKey(parsed) : String(row.week_start).slice(0, 10);
+        return [key, row as RevAgg];
+      })
+    );
+    const revenueByWeek = [];
+    for (let i = 7; i >= 0; i -= 1) {
+      const start = new Date(thisWeekStart);
+      start.setDate(start.getDate() - i * 7);
+      const end = new Date(start);
+      end.setDate(end.getDate() + 6);
+      const key = localDayKey(start);
+      const row = byWeek.get(key);
+      revenueByWeek.push({
+        label: `${fmtShort(start)} – ${fmtShort(end)}`,
+        week: `W${8 - i}`,
+        week_key: key,
+        week_start: key,
+        week_end: localDayKey(end),
+        orders: Number(row?.orders) || 0,
+        revenue: Number(row?.revenue) || 0,
+      });
+    }
+
+    const [stockByStatus] = await db.query(
+      `
+      SELECT i.status AS name, COUNT(*) AS value
+      FROM tblInventory i
+      JOIN tblProduct p ON p.productID = i.productID
+      WHERE p.companyID = :companyID
+      GROUP BY i.status
+      ORDER BY value DESC
+    `,
+      { companyID }
+    );
+
+    const [topProducts] = await db.query(
+      `
+      SELECT p.name,
+             COALESCE(SUM(oi.quantity), 0) AS sold,
+             COALESCE(SUM(oi.quantity * oi.price), 0) AS amount
+      FROM tblOrderItem oi
+      JOIN tblOrder o ON o.orderID = oi.orderID
+      JOIN tblProduct p ON p.productID = oi.productID
+      WHERE o.companyID = :companyID AND o.status <> 'cancelled'
+      GROUP BY p.productID, p.name
+      ORDER BY sold DESC
+      LIMIT 6
+    `,
+      { companyID }
+    );
+
+    return ok(res, {
+      stats,
+      charts: {
+        revenueByDay,
+        revenueByWeek,
+        ordersByStatus: ordersByStatus || [],
+        stockByStatus: stockByStatus || [],
+        topProducts: topProducts || [],
+      },
+      recentOrders,
+      lowStock,
+      notifications: {
+        stockAlerts: lowStock || [],
+        topStocks: topStocks || [],
+        birthdays: birthdays || [],
+        festivals: festivals || [],
+      },
+    });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
@@ -522,7 +769,8 @@ export const categories = async (req, res) => {
 export const saveCategory = async (req, res) => {
   try {
     const companyID = requireCompanyId(req.user);
-    const name = req.body.name;
+    const name = String(req.body.name || '').trim();
+    if (!name) return fail(res, 'Category name is required', 400);
     const slug = slugify(req.body.slug || name);
     const description = req.body.description || '';
     const id = req.body.id || req.params.id;
@@ -532,14 +780,14 @@ export const saveCategory = async (req, res) => {
          WHERE categoryID=:id AND companyID=:companyID`,
         { name, slug, description, id, companyID }
       );
-    } else {
-      await db.query(
-        `INSERT INTO tblCategory (name, slug, description, companyID)
-         VALUES (:name, :slug, :description, :companyID)`,
-        { name, slug, description, companyID }
-      );
+      return ok(res, { id: Number(id) }, 'Category updated');
     }
-    return ok(res, {}, 'Category saved');
+    const [result] = await db.query(
+      `INSERT INTO tblCategory (name, slug, description, companyID)
+       VALUES (:name, :slug, :description, :companyID)`,
+      { name, slug, description, companyID }
+    );
+    return ok(res, { id: result.insertId }, 'Category created', 201);
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
@@ -559,6 +807,268 @@ export const deleteCategory = async (req, res) => {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
     return fail(res, 'Could not delete category', 500);
+  }
+};
+
+async function ensureCompanyBrands(companyID: number) {
+  const [[{ c }]] = await db.query(
+    `SELECT COUNT(*) AS c FROM tblBrand WHERE companyID = :companyID`,
+    { companyID }
+  );
+  if (Number(c) > 0) return;
+
+  const [fromProducts] = await db.query(
+    `SELECT DISTINCT TRIM(brand) AS name
+     FROM tblProduct
+     WHERE companyID = :companyID AND brand IS NOT NULL AND TRIM(brand) <> ''
+     ORDER BY name`,
+    { companyID }
+  );
+  const names = fromProducts.length
+    ? fromProducts.map((r: any) => String(r.name))
+    : ['BuildNex ShopOS'];
+
+  for (const name of names) {
+    const slug = slugify(name);
+    await db.query(
+      `INSERT INTO tblBrand (name, slug, description, companyID, is_active)
+       VALUES (:name, :slug, :description, :companyID, 1)`,
+      { name, slug, description: null, companyID }
+    ).catch(() => null);
+  }
+}
+
+export const brands = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    await ensureCompanyBrands(companyID);
+    const [rows] = await db.query(
+      `
+      SELECT b.*, b.brandID AS id,
+             COUNT(p.productID) AS product_count
+      FROM tblBrand b
+      LEFT JOIN tblProduct p
+        ON p.companyID = b.companyID AND TRIM(p.brand) = TRIM(b.name)
+      WHERE b.companyID = :companyID
+      GROUP BY b.brandID
+      ORDER BY b.name
+      `,
+      { companyID }
+    );
+    return ok(res, { brands: rows });
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Failed to load brands', 500);
+  }
+};
+
+export const saveBrand = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const name = String(req.body.name || '').trim();
+    if (!name) return fail(res, 'Brand name is required', 400);
+    const slug = slugify(req.body.slug || name);
+    const description = req.body.description || null;
+    const isActive = req.body.is_active === false || req.body.is_active === 0 ? 0 : 1;
+    const id = req.body.id || req.params.id;
+
+    if (id) {
+      const [[prev]] = await db.query(
+        `SELECT name FROM tblBrand WHERE brandID = :id AND companyID = :companyID LIMIT 1`,
+        { id, companyID }
+      );
+      if (!prev) return fail(res, 'Brand not found', 404);
+      await db.query(
+        `UPDATE tblBrand SET name=:name, slug=:slug, description=:description, is_active=:is_active
+         WHERE brandID=:id AND companyID=:companyID`,
+        { name, slug, description, is_active: isActive, id, companyID }
+      );
+      // Keep product.brand text in sync when renamed
+      if (prev.name && prev.name !== name) {
+        await db.query(
+          `UPDATE tblProduct SET brand = :name
+           WHERE companyID = :companyID AND TRIM(brand) = :oldName`,
+          { name, companyID, oldName: prev.name }
+        );
+      }
+      return ok(res, { id: Number(id), name }, 'Brand updated');
+    }
+
+    const [result] = await db.query(
+      `INSERT INTO tblBrand (name, slug, description, companyID, is_active)
+       VALUES (:name, :slug, :description, :companyID, :is_active)`,
+      { name, slug, description, companyID, is_active: isActive }
+    );
+    return ok(res, { id: result.insertId, name }, 'Brand created', 201);
+  } catch (err: any) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    if (err?.code === 'ER_DUP_ENTRY') return fail(res, 'Brand already exists', 409);
+    console.error(err);
+    return fail(res, 'Could not save brand', 500);
+  }
+};
+
+export const deleteBrand = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const [[row]] = await db.query(
+      `SELECT brandID, name FROM tblBrand WHERE brandID = :id AND companyID = :companyID LIMIT 1`,
+      { id: req.params.id, companyID }
+    );
+    if (!row) return fail(res, 'Brand not found', 404);
+
+    const [[{ c }]] = await db.query(
+      `SELECT COUNT(*) AS c FROM tblProduct
+       WHERE companyID = :companyID AND TRIM(brand) = :name`,
+      { companyID, name: row.name }
+    );
+    if (Number(c) > 0) {
+      return fail(res, `Cannot delete — ${c} product(s) use this brand`, 400);
+    }
+
+    await db.query(
+      `DELETE FROM tblBrand WHERE brandID = :id AND companyID = :companyID`,
+      { id: req.params.id, companyID }
+    );
+    return ok(res, {}, 'Brand deleted');
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Could not delete brand', 500);
+  }
+};
+
+const DEFAULT_MATERIAL_TYPES = ['Cotton', 'Linen', 'Polyester', 'Silk', 'Wool', 'Denim', 'Rayon', 'Blend'];
+
+async function ensureCompanyMaterialTypes(companyID: number) {
+  const [[{ c }]] = await db.query(
+    `SELECT COUNT(*) AS c FROM tblMaterialType WHERE companyID = :companyID`,
+    { companyID }
+  );
+  if (Number(c) > 0) return;
+
+  const [fromProducts] = await db.query(
+    `SELECT DISTINCT TRIM(fabric) AS name
+     FROM tblProduct
+     WHERE companyID = :companyID AND fabric IS NOT NULL AND TRIM(fabric) <> ''
+     ORDER BY name`,
+    { companyID }
+  );
+  const names = Array.from(
+    new Set([
+      ...fromProducts.map((r: any) => String(r.name)),
+      ...DEFAULT_MATERIAL_TYPES,
+    ])
+  );
+
+  for (const name of names) {
+    const slug = slugify(name);
+    await db.query(
+      `INSERT INTO tblMaterialType (name, slug, description, companyID, is_active)
+       VALUES (:name, :slug, :description, :companyID, 1)`,
+      { name, slug, description: null, companyID }
+    ).catch(() => null);
+  }
+}
+
+export const materialTypes = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    await ensureCompanyMaterialTypes(companyID);
+    const [rows] = await db.query(
+      `
+      SELECT m.*, m.materialTypeID AS id,
+             COUNT(p.productID) AS product_count
+      FROM tblMaterialType m
+      LEFT JOIN tblProduct p
+        ON p.companyID = m.companyID AND TRIM(p.fabric) = TRIM(m.name)
+      WHERE m.companyID = :companyID
+      GROUP BY m.materialTypeID
+      ORDER BY m.name
+      `,
+      { companyID }
+    );
+    return ok(res, { materialTypes: rows });
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Failed to load material types', 500);
+  }
+};
+
+export const saveMaterialType = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const name = String(req.body.name || '').trim();
+    if (!name) return fail(res, 'Material type name is required', 400);
+    const slug = slugify(req.body.slug || name);
+    const description = req.body.description || null;
+    const isActive = req.body.is_active === false || req.body.is_active === 0 ? 0 : 1;
+    const id = req.body.id || req.params.id;
+
+    if (id) {
+      const [[prev]] = await db.query(
+        `SELECT name FROM tblMaterialType WHERE materialTypeID = :id AND companyID = :companyID LIMIT 1`,
+        { id, companyID }
+      );
+      if (!prev) return fail(res, 'Material type not found', 404);
+      await db.query(
+        `UPDATE tblMaterialType SET name=:name, slug=:slug, description=:description, is_active=:is_active
+         WHERE materialTypeID=:id AND companyID=:companyID`,
+        { name, slug, description, is_active: isActive, id, companyID }
+      );
+      if (prev.name && prev.name !== name) {
+        await db.query(
+          `UPDATE tblProduct SET fabric = :name
+           WHERE companyID = :companyID AND TRIM(fabric) = :oldName`,
+          { name, companyID, oldName: prev.name }
+        );
+      }
+      return ok(res, { id: Number(id), name }, 'Material type updated');
+    }
+
+    const [result] = await db.query(
+      `INSERT INTO tblMaterialType (name, slug, description, companyID, is_active)
+       VALUES (:name, :slug, :description, :companyID, :is_active)`,
+      { name, slug, description, companyID, is_active: isActive }
+    );
+    return ok(res, { id: result.insertId, name }, 'Material type created', 201);
+  } catch (err: any) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    if (err?.code === 'ER_DUP_ENTRY') return fail(res, 'Material type already exists', 409);
+    console.error(err);
+    return fail(res, 'Could not save material type', 500);
+  }
+};
+
+export const deleteMaterialType = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const [[row]] = await db.query(
+      `SELECT materialTypeID, name FROM tblMaterialType WHERE materialTypeID = :id AND companyID = :companyID LIMIT 1`,
+      { id: req.params.id, companyID }
+    );
+    if (!row) return fail(res, 'Material type not found', 404);
+
+    const [[{ c }]] = await db.query(
+      `SELECT COUNT(*) AS c FROM tblProduct
+       WHERE companyID = :companyID AND TRIM(fabric) = :name`,
+      { companyID, name: row.name }
+    );
+    if (Number(c) > 0) {
+      return fail(res, `Cannot delete — ${c} product(s) use this material type`, 400);
+    }
+
+    await db.query(
+      `DELETE FROM tblMaterialType WHERE materialTypeID = :id AND companyID = :companyID`,
+      { id: req.params.id, companyID }
+    );
+    return ok(res, {}, 'Material type deleted');
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Could not delete material type', 500);
   }
 };
 
@@ -644,7 +1154,8 @@ export const orderDetail = async (req, res) => {
     const companyID = requireCompanyId(req.user);
     const [tblOrder] = await db.query(
       `SELECT o.*, u.name AS customer_name, u.email AS customer_email
-       FROM tblOrder o JOIN tblUser u ON u.userID = o.userID
+       FROM tblOrder o
+       LEFT JOIN tblUser u ON u.userID = o.userID
        WHERE o.orderID = :id AND o.companyID = :companyID`,
       { id: req.params.id, companyID }
     );
@@ -657,15 +1168,108 @@ export const orderDetail = async (req, res) => {
        FROM tblOrderStatusHistory h
        LEFT JOIN tblUser u ON u.userID = h.createdByUserID
        WHERE h.orderID = :id
-       ORDER BY h.created_at ASC, h.id ASC`,
+       ORDER BY h.created_at ASC, h.orderStatusHistoryID ASC`,
       { id: req.params.id }
     );
-    return ok(res, { order: tblOrder[0], items, history });
+    const [[invoice]] = await db.query(
+      `SELECT billingID AS id, billingID, invoice_no, orderID, customer_name, customer_email,
+              amount, tax, total, status, notes, created_at
+       FROM tblBilling
+       WHERE orderID = :id AND companyID = :companyID
+       ORDER BY billingID DESC LIMIT 1`,
+      { id: req.params.id, companyID }
+    );
+    const [payments] = await db.query(
+      `SELECT * FROM tblPosPayment WHERE orderID = :id ORDER BY posPaymentID ASC`,
+      { id: req.params.id }
+    );
+    return ok(res, { order: tblOrder[0], items, history, invoice: invoice || null, payments });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
     return fail(res, 'Failed to load order', 500);
   }
+};
+
+/** Track by bill no / invoice no / order number / order id */
+export const trackOrder = async (req, res) => {
+  try {
+    const companyID = requireCompanyId(req.user);
+    const q = String(req.query.q || req.params.q || '').trim();
+    if (!q) return fail(res, 'Enter bill / invoice / order number', 400);
+
+    const num = Number(q);
+    const params: any = { companyID, q, like: `%${q}%` };
+    let orderId: number | null = null;
+
+    // 1) Exact invoice / billing id
+    const [[byBill]] = await db.query(
+      `SELECT orderID FROM tblBilling
+       WHERE companyID = :companyID
+         AND (invoice_no = :q OR CAST(billingID AS CHAR) = :q)
+       ORDER BY billingID DESC LIMIT 1`,
+      params
+    );
+    if (byBill?.orderID) orderId = Number(byBill.orderID);
+
+    // 2) Order number / order id
+    if (!orderId) {
+      const [[byOrder]] = await db.query(
+        `SELECT orderID FROM tblOrder
+         WHERE companyID = :companyID
+           AND (order_number = :q OR CAST(orderID AS CHAR) = :q)
+         ORDER BY orderID DESC LIMIT 1`,
+        params
+      );
+      if (byOrder?.orderID) orderId = Number(byOrder.orderID);
+    }
+
+    // 3) Fuzzy invoice / phone / name
+    if (!orderId) {
+      const [[fuzzy]] = await db.query(
+        `SELECT o.orderID
+         FROM tblOrder o
+         LEFT JOIN tblBilling b ON b.orderID = o.orderID AND b.companyID = o.companyID
+         LEFT JOIN tblUser u ON u.userID = o.userID
+         WHERE o.companyID = :companyID
+           AND (
+             b.invoice_no LIKE :like
+             OR o.order_number LIKE :like
+             OR o.shipping_name LIKE :like
+             OR o.shipping_phone LIKE :like
+             OR u.name LIKE :like
+             OR u.phone LIKE :like
+           )
+         ORDER BY o.orderID DESC LIMIT 1`,
+        params
+      );
+      if (fuzzy?.orderID) orderId = Number(fuzzy.orderID);
+    }
+
+    if (!orderId && Number.isFinite(num) && num > 0) {
+      orderId = num;
+    }
+    if (!orderId) return fail(res, 'No order found for this bill / order number', 404);
+
+    req.params.id = String(orderId);
+    return orderDetail(req, res);
+  } catch (err) {
+    if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
+    console.error(err);
+    return fail(res, 'Failed to track order', 500);
+  }
+};
+
+export const returnOrderPanel = async (req, res) => {
+  req.body = {
+    ...req.body,
+    status: 'returned',
+    return_reason: req.body.return_reason || req.body.reason || 'Returned from Order Tracking',
+    inspection_done: true,
+    refund_status: req.body.refund_status || 'pending',
+    history_note: 'Returned from Order Tracking',
+  };
+  return updateOrderStatus(req, res);
 };
 
 async function ensureWalkInCustomer(connection) {
@@ -960,9 +1564,11 @@ export const updateOrderStatus = async (req, res) => {
       req.body.inspection_done === '1';
 
     await connection.beginTransaction();
+    const orderPk = previous.orderID || previous.id;
+    previous.id = orderPk;
     const [items] = await connection.query(
       'SELECT productID, size, color, quantity FROM tblOrderItem WHERE orderID = :orderId',
-      { orderId: previous.id }
+      { orderId: orderPk }
     );
 
     const flags = await applyOrderStockEffects({
@@ -1083,7 +1689,7 @@ export const cancelOrderPanel = async (req, res) => {
     cancellation_reason: req.body.cancellation_reason || req.body.reason,
     history_note: 'Cancelled from panel',
   };
-  return exports.updateOrderStatus(req, res);
+  return updateOrderStatus(req, res);
 };
 
 export const archiveOrder = async (req, res) => {
@@ -1227,17 +1833,20 @@ export const lowStockAlerts = async (req, res) => {
 export const stockItems = async (req, res) => {
   try {
     const companyID = requireCompanyId(req.user);
-    const items = await listStockItems({
-      companyID,
-      q: req.query.q || '',
-      categoryID: req.query.categoryID || '',
-      brand: req.query.brand || '',
-      size: req.query.size || '',
-      color: req.query.color || '',
-      warehouseID: req.query.warehouseID || '',
-      status: req.query.status || '',
-    });
-    return ok(res, { items });
+    const [items, summary] = await Promise.all([
+      listStockItems({
+        companyID,
+        q: req.query.q || '',
+        categoryID: req.query.categoryID || '',
+        brand: req.query.brand || '',
+        size: req.query.size || '',
+        color: req.query.color || '',
+        warehouseID: req.query.warehouseID || '',
+        status: req.query.status || '',
+      }),
+      stockStatusSummary(companyID),
+    ]);
+    return ok(res, { items, summary });
   } catch (err) {
     if (err instanceof CompanyScopeError) return fail(res, err.message, err.status);
     console.error(err);
@@ -1495,8 +2104,9 @@ export const customers = async (req, res) => {
     }
     const [customers] = await db.query(
       `
-      SELECT u.userID AS id, u.userID, u.name, u.email, u.phone, u.address, u.city, u.state, u.pincode,
-             u.is_active, u.created_at, u.companyID,
+      SELECT u.userID AS id, u.userID, u.name, u.email, u.phone, u.gender, u.whatsapp,
+             u.address, u.landmark, u.city, u.state, u.pincode, u.gstin, u.pan,
+             u.date_of_birth, u.notes, u.is_active, u.created_at, u.companyID,
         COUNT(o.orderID) AS order_count, COALESCE(SUM(o.total), 0) AS spent
       FROM tblUser u
       ${USER_ROLE_JOIN}
@@ -1516,6 +2126,9 @@ export const customers = async (req, res) => {
   }
 };
 
+const CUSTOMER_DETAIL_SELECT = `userID AS id, name, email, phone, gender, whatsapp, address, landmark,
+  city, state, pincode, gstin, pan, date_of_birth, notes, is_active`;
+
 export const saveCustomer = async (req, res) => {
   try {
     const companyID = requireCompanyId(req.user);
@@ -1527,12 +2140,30 @@ export const saveCustomer = async (req, res) => {
     const city = String(req.body.city || '').trim() || 'Local';
     const state = String(req.body.state || '').trim() || 'N/A';
     const pincode = String(req.body.pincode || '').trim() || '000000';
+    const gender = String(req.body.gender || '').trim() || null;
+    const whatsapp = String(req.body.whatsapp || '').trim() || null;
+    const landmark = String(req.body.landmark || '').trim() || null;
+    const gstin = String(req.body.gstin || '').trim().toUpperCase() || null;
+    const pan = String(req.body.pan || '').trim().toUpperCase() || null;
+    const notes = String(req.body.notes || '').trim() || null;
+    const dobRaw = String(req.body.date_of_birth || '').trim();
+    const date_of_birth = dobRaw || null;
     const isActive =
       req.body.is_active === false || req.body.is_active === 0 || req.body.is_active === '0' ? 0 : 1;
 
     if (!phone || !name || !address) {
       return fail(res, 'Customer name, mobile and address are required');
     }
+
+    const detailFields = {
+      gender,
+      whatsapp,
+      landmark,
+      gstin,
+      pan,
+      date_of_birth,
+      notes,
+    };
 
     if (customerId) {
       const [owned] = await db.query(
@@ -1553,13 +2184,26 @@ export const saveCustomer = async (req, res) => {
         `UPDATE tblUser SET
           name = :name, phone = :phone, address = :address,
           email = COALESCE(:email, email),
-          city = :city, state = :state, pincode = :pincode, is_active = :is_active
+          city = :city, state = :state, pincode = :pincode, is_active = :is_active,
+          gender = :gender, whatsapp = :whatsapp, landmark = :landmark,
+          gstin = :gstin, pan = :pan, date_of_birth = :date_of_birth, notes = :notes
          WHERE userID = :id AND companyID = :companyID`,
-        { id: customerId, companyID, name, phone, address, email, city, state, pincode, is_active: isActive }
+        {
+          id: customerId,
+          companyID,
+          name,
+          phone,
+          address,
+          email,
+          city,
+          state,
+          pincode,
+          is_active: isActive,
+          ...detailFields,
+        }
       );
       const [rows] = await db.query(
-        `SELECT userID AS id, name, email, phone, address, city, state, pincode, is_active
-         FROM tblUser WHERE userID = :id`,
+        `SELECT ${CUSTOMER_DETAIL_SELECT} FROM tblUser WHERE userID = :id`,
         { id: customerId }
       );
       return ok(res, { customer: rows[0] }, 'Customer updated');
@@ -1576,13 +2220,14 @@ export const saveCustomer = async (req, res) => {
       await db.query(
         `UPDATE tblUser SET
           name = :name, address = :address, email = COALESCE(:email, email),
-          city = :city, state = :state, pincode = :pincode, is_active = 1
+          city = :city, state = :state, pincode = :pincode, is_active = 1,
+          gender = :gender, whatsapp = :whatsapp, landmark = :landmark,
+          gstin = :gstin, pan = :pan, date_of_birth = :date_of_birth, notes = :notes
          WHERE userID = :id AND companyID = :companyID`,
-        { id, companyID, name, address, email, city, state, pincode }
+        { id, companyID, name, address, email, city, state, pincode, ...detailFields }
       );
       const [rows] = await db.query(
-        `SELECT userID AS id, name, email, phone, address, city, state, pincode, is_active
-         FROM tblUser WHERE userID = :id`,
+        `SELECT ${CUSTOMER_DETAIL_SELECT} FROM tblUser WHERE userID = :id`,
         { id }
       );
       return ok(res, { customer: rows[0] }, 'Customer updated');
@@ -1597,13 +2242,14 @@ export const saveCustomer = async (req, res) => {
       const id = byEmail[0].id;
       await db.query(
         `UPDATE tblUser SET name = :name, phone = :phone, address = :address, city = :city, state = :state,
-         pincode = :pincode, companyID = :companyID, is_active = 1
+         pincode = :pincode, companyID = :companyID, is_active = 1,
+         gender = :gender, whatsapp = :whatsapp, landmark = :landmark,
+         gstin = :gstin, pan = :pan, date_of_birth = :date_of_birth, notes = :notes
          WHERE userID = :id`,
-        { id, name, phone, address, city, state, pincode, companyID }
+        { id, name, phone, address, city, state, pincode, companyID, ...detailFields }
       );
       const [rows] = await db.query(
-        `SELECT userID AS id, name, email, phone, address, city, state, pincode, is_active
-         FROM tblUser WHERE userID = :id`,
+        `SELECT ${CUSTOMER_DETAIL_SELECT} FROM tblUser WHERE userID = :id`,
         { id }
       );
       return ok(res, { customer: rows[0] }, 'Customer updated');
@@ -1613,9 +2259,11 @@ export const saveCustomer = async (req, res) => {
     const customerRoleId = await getRoleId('customer');
     const [ins] = await db.query(
       `INSERT INTO tblUser
-       (name, email, phone, password, address, city, state, pincode, roleID, companyID, isAdmin, isSuperAdmin, branchID, is_active)
+       (name, email, phone, password, address, city, state, pincode, roleID, companyID, isAdmin, isSuperAdmin, branchID, is_active,
+        gender, whatsapp, landmark, gstin, pan, date_of_birth, notes)
        VALUES
-       (:name, :email, :phone, :password, :address, :city, :state, :pincode, :roleID, :companyID, 0, 0, 0, 1)`,
+       (:name, :email, :phone, :password, :address, :city, :state, :pincode, :roleID, :companyID, 0, 0, 0, 1,
+        :gender, :whatsapp, :landmark, :gstin, :pan, :date_of_birth, :notes)`,
       {
         name,
         email: safeEmail,
@@ -1627,11 +2275,11 @@ export const saveCustomer = async (req, res) => {
         pincode,
         roleID: customerRoleId,
         companyID,
+        ...detailFields,
       }
     );
     const [rows] = await db.query(
-      `SELECT userID AS id, name, email, phone, address, city, state, pincode, is_active
-       FROM tblUser WHERE userID = :id`,
+      `SELECT ${CUSTOMER_DETAIL_SELECT} FROM tblUser WHERE userID = :id`,
       { id: ins.insertId }
     );
     return ok(res, { customer: rows[0] }, 'Customer created', 201);

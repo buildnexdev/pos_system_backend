@@ -28,8 +28,8 @@ const ALLOWED_TRANSITIONS = {
   confirmed: ['processing', 'cancelled'],
   processing: ['packed', 'cancelled'],
   packed: ['shipped', 'cancelled'],
-  shipped: ['delivered', 'return_requested'],
-  delivered: ['return_requested'],
+  shipped: ['delivered', 'return_requested', 'returned'],
+  delivered: ['return_requested', 'returned', 'cancelled'],
   cancelled: [],
   return_requested: ['returned', 'cancelled'],
   returned: ['refund_pending'],
@@ -126,7 +126,9 @@ async function applyOrderStockEffects({
     nextStatus === 'cancelled' && flags.stock_reserved && !flags.stock_deducted;
   const shouldFinalize = nextStatus === 'shipped' && !flags.stock_deducted;
   const shouldRestock =
-    nextStatus === 'returned' && inspectionDone && !flags.return_restocked;
+    ((nextStatus === 'returned' && inspectionDone) ||
+      (nextStatus === 'cancelled' && flags.stock_deducted)) &&
+    !flags.return_restocked;
 
   if (shouldReserve) {
     for (const item of items) {
@@ -211,6 +213,7 @@ async function applyOrderStockEffects({
   }
 
   if (shouldRestock) {
+    const orderRef = order.orderID || order.id;
     for (const item of items) {
       await restockReturnedSellable(
         {
@@ -219,8 +222,11 @@ async function applyOrderStockEffects({
           color: item.color,
           qty: item.quantity,
           refType: 'order',
-          refId: order.id,
-          note: `Return restock after inspection ${order.order_number}`,
+          refId: orderRef,
+          note:
+            nextStatus === 'cancelled'
+              ? `Cancel restock ${order.order_number}`
+              : `Return restock after inspection ${order.order_number}`,
           createdBy,
         },
         connection
